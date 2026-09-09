@@ -19,7 +19,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": "openai/gpt-oss-20b",
                 "messages": [
                     {"role": "system", "content": "You are Rosita, friendly AI assistant."},
                     {"role": "user", "content": user_text}
@@ -28,15 +28,9 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=30
         )
         data = r.json()
-        print("GROQ DEBUG:", data)
-
-        if "choices" not in data:
-            await update.message.reply_text(f"Groq error: {data}")
-            return
-
         answer = data["choices"][0]["message"]["content"]
     except Exception as e:
-        answer = f"Sorry, I had an error: {e}"
+        answer = f"Sorry, I had an error: {e} | Data: {data if 'data' in locals() else 'no data'}"
     await update.message.reply_text(answer)
 
 def run_flask():

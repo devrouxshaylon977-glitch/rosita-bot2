@@ -31,3 +31,5 @@ def rosita_reply(sender, user_text):
     return reply
 
 print("Rosita ready")
+import time
+while True: time.sleep(60)

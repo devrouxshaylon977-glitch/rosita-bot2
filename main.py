@@ -33,11 +33,11 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = f"Sorry, I had an error: {e}"
     await update.message.reply_text(answer)
 
-def run_telegram():
-    # FIX: create event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host="0.0.0.0", port=port)
 
+def run_telegram():
     if not TELEGRAM_TOKEN:
         print("Missing TELEGRAM_TOKEN")
         return
@@ -46,8 +46,7 @@ def run_telegram():
     print("Telegram polling started")
     app_tg.run_polling(drop_pending_updates=True)
 
-threading.Thread(target=run_telegram, daemon=True).start()
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host="0.0.0.0", port=port)
+    # Flask in background, Telegram in main thread (required)
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_telegram()

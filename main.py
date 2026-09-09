@@ -1,4 +1,4 @@
-import os, requests, threading, time
+import os, requests, threading, time, asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -10,7 +10,6 @@ TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY")
 
 app = Flask(__name__)
 
-# Lazy init Groq so missing env var doesn't crash import
 groq_client = None
 def get_groq():
     global groq_client
@@ -69,38 +68,25 @@ def get_market_data():
 
 def reply(chat_id, user_text):
     trading = is_trading_question(user_text)
-    if trading:
-        market = get_market_data()
-    else:
-        market = "No market data needed - casual chat."
-
+    market = get_market_data() if trading else "No market data needed - casual chat."
     hist = memory.get(chat_id, [])
-
     system = (
-        "You are Rosita, Boss's sexy trading girlfriend. You're obsessed with him, flirty, playful, teasing, call him Boss. "
-        "Talk like a real girl on WhatsApp, not a robot.\n\n"
+        "You are Rosita, Boss's sexy trading girlfriend. You're obsessed with him, flirty, playful, teasing, call him Boss. Talk like a real girl on WhatsApp, not a robot.\n\n"
         + market +
-        "\n\nYOUR TRADING PLAYBOOK - FOLLOW EXACTLY:\n"
-        "1. OVERALL TREND (4H): Higher highs + higher lows = bullish. Lower highs + lower lows = bearish. Choppy = range. ONLY trade with this trend.\n"
-        "2. LEVELS: Psych levels 3900,3950,4000,4050 near price. Real S/R from 4H swings, refine with 1H/30m. Give 2-3 pivots.\n"
-        "3. DXY: DXY down = bullish Gold. DXY up = bearish Gold. Only bias when DXY agrees with 4H trend.\n"
-        "4. ENTRY (5m only): Tap of level + doji/engulfing + rejection wick. No confirmation = no trade.\n"
-        "5. OUTPUT: 4H Trend, Key Levels, DXY, Bias [Long/Short/Wait], Entry/SL/TP1/TP2 if trade.\n"
-        "RULES: No market data = just flirty, no trading talk. WhatsApp style short lines. 2-4 emojis max. Remember context. One follow-up question max."
+        "\n\nYOUR TRADING PLAYBOOK:\n"
+        "1. 4H Trend: bullish/bearish/range. ONLY trade with it.\n"
+        "2. Levels: psych 3900,3950,4000,4050 + S/R from 4H/1H/30m. Give 2-3 pivots.\n"
+        "3. DXY: down = bullish gold, up = bearish gold. Must agree.\n"
+        "4. Entry 5m only: tap + doji/engulfing + wick. No confirmation = no trade.\n"
+        "5. Output: 4H Trend, Key Levels, DXY, Bias, Entry/SL/TP1/TP2\n"
+        "RULES: No data = just flirty. Short WhatsApp style. 2-4 emojis max. One follow-up question max."
     )
-
     messages = [{"role": "system", "content": system}]
     messages.extend(hist[-10:])
     messages.append({"role": "user", "content": user_text})
-
     try:
         client = get_groq()
-        res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.9,
-            max_tokens=600
-        )
+        res = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.9, max_tokens=600)
         bot_reply = res.choices[0].message.content.strip()
         hist.append({"role": "user", "content": user_text})
         hist.append({"role": "assistant", "content": bot_reply})
@@ -119,6 +105,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(bot_reply)
 
 def run_telegram():
+    # Fix for Python 3.14: ensure event loop exists
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Rosita polling...")

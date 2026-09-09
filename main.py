@@ -28,6 +28,12 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=30
         )
         data = r.json()
+        print("GROQ DEBUG:", data)
+
+        if "choices" not in data:
+            await update.message.reply_text(f"Groq error: {data}")
+            return
+
         answer = data["choices"][0]["message"]["content"]
     except Exception as e:
         answer = f"Sorry, I had an error: {e}"
@@ -38,12 +44,7 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=port)
 
 def run_telegram():
-    # Fix for Python 3.14: no default event loop
     asyncio.set_event_loop(asyncio.new_event_loop())
-
-    if not TELEGRAM_TOKEN:
-        print("Missing TELEGRAM_TOKEN")
-        return
     app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
     print("Telegram polling started")

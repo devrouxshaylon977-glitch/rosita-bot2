@@ -38,6 +38,9 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=port)
 
 def run_telegram():
+    # Fix for Python 3.14: no default event loop
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
     if not TELEGRAM_TOKEN:
         print("Missing TELEGRAM_TOKEN")
         return
@@ -47,6 +50,5 @@ def run_telegram():
     app_tg.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    # Flask in background, Telegram in main thread (required)
     threading.Thread(target=run_flask, daemon=True).start()
     run_telegram()

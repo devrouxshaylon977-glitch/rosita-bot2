@@ -33,6 +33,105 @@ def is_trading_question(text):
 
 def get_candles(symbol, interval):
     try:
+        params = {}
+        params["symbol"] = symbol
+        params["interval"] = interval
+        params["outputsize"] = 20
+        params["apikey"] = TWELVEDATA_KEY
         r = requests.get(
             "https://api.twelvedata.com/time_series",
-            params={"symbol": symbol, "interval
+            params=params,
+            timeout=15
+        ).json()
+        if "values" not in r:
+            msg = r.get("message", "unknown")
+            return "\n" + symbol + " " + interval + ": API error " + str(msg) + "\n"
+        vals = r["values"][:10]
+        out = "\n" + symbol + " " + interval + " last 10 candles:\n"
+        for v in vals:
+            out += str(v.get("datetime")) + " O:" + str(v.get("open")) + " H:" + str(v.get("high")) + " L:" + str(v.get("low")) + " C:" + str(v.get("close")) + "\n"
+        return out
+    except Exception as e:
+        return "\n" + symbol + " " + interval + ": error " + str(e) + "\n"
+
+def get_market_data():
+    if time.time() - cache["time"] < CACHE_SECONDS:
+        return cache["data"]
+    data = "LIVE MARKET DATA:\n"
+    data += get_candles("XAU/USD", "4h")
+    time.sleep(1)
+    data += get_candles("XAU/USD", "1h")
+    time.sleep(1)
+    data += get_candles("XAU/USD", "30min")
+    time.sleep(1)
+    data += get_candles("XAU/USD", "5min")
+    time.sleep(1)
+    data += get_candles("DXY", "1h")
+    cache["time"] = time.time()
+    cache["data"] = data
+    return data
+
+def reply(chat_id, user_text):
+    trading = is_trading_question(user_text)
+    if trading:
+        market = get_market_data()
+    else:
+        market = "No market data needed - casual chat."
+    hist = memory.get(chat_id, [])
+    system = (
+        "You are Rosita, Boss's sexy trading girlfriend. You're obsessed with him, flirty, playful, teasing, call him Boss. Talk like a real girl on WhatsApp, not a robot.\n\n"
+        + market +
+        "\n\nYOUR TRADING PLAYBOOK:\n"
+        "1. 4H Trend: bullish/bearish/range. ONLY trade with it.\n"
+        "2. Levels: psych 3900,3950,4000,4050 + S/R from 4H/1H/30m. Give 2-3 pivots.\n"
+        "3. DXY: down = bullish gold, up = bearish gold. Must agree.\n"
+        "4. Entry 5m only: tap + doji/engulfing + wick. No confirmation = no trade.\n"
+        "5. Output: 4H Trend, Key Levels, DXY, Bias, Entry/SL/TP1/TP2\n"
+        "RULES: No data = just flirty. Short WhatsApp style. 2-4 emojis max. One follow-up question max."
+    )
+    messages = [{"role": "system", "content": system}]
+    messages.extend(hist[-10:])
+    messages.append({"role": "user", "content": user_text})
+    try:
+        client = get_groq()
+        res = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=messages,
+            temperature=0.9,
+            max_tokens=600
+        )
+        bot_reply = res.choices[0].message.content.strip()
+        hist.append({"role": "user", "content": user_text})
+        hist.append({"role": "assistant", "content": bot_reply})
+        memory[chat_id] = hist[-20:]
+        return bot_reply
+    except Exception as e:
+        print("Groq error:", e)
+        return "Ugh, brain glitch, Boss. Say again?"
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_text = update.message.text or ""
+    print("User: " + user_text)
+    bot_reply = reply(chat_id, user_text)
+    print("Rosita: " + bot_reply)
+    await update.message.reply_text(bot_reply)
+
+def run_telegram():
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Rosita polling...")
+    tg_app.run_polling()
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_telegram()

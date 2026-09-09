@@ -1,5 +1,6 @@
-import os, asyncio, logging, requests
+import os, asyncio, logging, requests, threading
 from datetime import datetime
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
@@ -13,9 +14,18 @@ TWELVEDATA_KEY = os.getenv("TWELVEDATA_KEY")
 BOSS_CHAT_ID = os.getenv("BOSS_CHAT_ID")
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))
+PORT = int(os.getenv("PORT", "10000"))
 
 client = Groq(api_key=GROQ_API_KEY)
 CACHE = {}
+
+web = Flask(__name__)
+@web.route("/")
+def health(): return "Rosita alive", 200
+@web.route("/health")
+def health2(): return "ok", 200
+def run_web(): web.run(host="0.0.0.0", port=PORT)
+threading.Thread(target=run_web, daemon=True).start()
 
 def get_candles(symbol="XAU/USD", interval="4h", n=60):
     key = f"{symbol}_{interval}"
@@ -43,9 +53,7 @@ def calc_levels(candles):
     highs=[c["h"] for c in candles]
     lows=[c["l"] for c in candles]
     last=closes[-1]
-    # sanity: gold should be >4000 in 2026
-    if last < 3000:
-        return None
+    if last < 3000: return None
     res=round(max(highs[-20:]),1)
     sup=round(min(lows[-20:]),1)
     return {"last":last,"res":res,"sup":sup}
@@ -75,8 +83,7 @@ async def ask_groq(user_text, chat_id):
         return "Brain fog, Boss - try again in 20 secs 🙏"
 
 async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text
-    reply = await ask_groq(txt, update.effective_chat.id)
+    reply = await ask_groq(update.message.text, update.effective_chat.id)
     await update.message.reply_text(reply)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -95,12 +102,14 @@ async def auto_signal_loop(app):
             logger.error(f"auto loop: {e}")
         await asyncio.sleep(900)
 
+async def post_init(app):
+    asyncio.create_task(auto_signal_loop(app))
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    asyncio.get_event_loop().create_task(auto_signal_loop(app))
-    logger.info("Rosita v5.2 polling...")
+    logger.info("Rosita v5.4.1 polling...")
     app.run_polling()
 
 if __name__ == "__main__":

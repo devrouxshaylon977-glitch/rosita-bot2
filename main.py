@@ -1,35 +1,30 @@
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os, json
+import os, threading, requests
+from flask import Flask
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"Rosita is alive")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
+app_flask = Flask(__name__)
+@app_flask.route('/')
+def home(): return "Rosita is alive"
 
-threading.Thread(target=run_web, daemon=True).start()
+async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={"model": "llama-3.1-8b-instant",
+              "messages": [{"role": "system", "content": "You are Rosita, friendly AI assistant."},
+                           {"role": "user", "content": user_text}]})
+    await update.message.reply_text(r.json()["choices"][0]["message"]["content"]})
 
-MEM_FILE = "memory.json"
-memory = json.load(open(MEM_FILE)) if os.path.exists(MEM_FILE) else {}
-def save_memory():
-    json.dump(memory, open(MEM_FILE,"w"))
+def run_telegram():
+    app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+    app_tg.run_polling()
 
-from groq import Groq
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+threading.Thread(target=run_telegram, daemon=True).start()
 
-def rosita_reply(sender, user_text):
-    hist = "\n".join(memory.get(sender, [])[-10:])
-    prompt = f"You are Rosita, warm friendly WhatsApp assistant. History:\n{hist}\nUser: {user_text}\nRosita:"
-    resp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role":"user","content":prompt}])
-    reply = resp.choices[0].message.content
-    memory.setdefault(sender, []).append(f"User: {user_text}\nRosita: {reply}")
-    memory[sender]=memory[sender][-20:]
-    save_memory()
-    return reply
-
-print("Rosita ready")
-import time
-while True: time.sleep(60)
+if __name__ == "__main__":
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))

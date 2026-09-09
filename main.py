@@ -65,7 +65,7 @@ Boss calls you 'she'."""
 
 async def ask_groq(user_text, chat_id):
     candles_4h = get_candles("XAU/USD","4h",60)
-    candles_5m = get_candles("XAU/USD","5m",60)
+    candles_5m = get_candles("XAU/USD","5min",60)
     lv = calc_levels(candles_4h)
     if not lv:
         return "No live data right now Boss, TwelveData hiccup - give me 1 min and ping me again 😅"
@@ -73,7 +73,7 @@ async def ask_groq(user_text, chat_id):
     ctx = f"""Live XAU/USD: {lv['last']}, 4h Res {lv['res']}, Sup {lv['sup']}, Risk ${risk_amt:.2f}. 5m candles: {candles_5m[-3:] if candles_5m else 'n/a'}"""
     try:
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[{"role":"system","content":SYSTEM},{"role":"user","content":f"{ctx}\n\nBoss: {user_text}"}],
             temperature=0.7, max_tokens=500
         )
@@ -109,7 +109,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    logger.info("Rosita v5.4.1 polling...")
+    logger.info("Rosita v5.4.2 polling...")
     app.run_polling()
 
 if __name__ == "__main__":

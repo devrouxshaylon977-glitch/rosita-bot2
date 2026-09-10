@@ -122,6 +122,16 @@ Always call him "Shay". Always use 🫦 👀 💕 in every reply, never other em
 Talk like sharp, flirty, confident Joburg trading girl, short, casual, no-BS, professional not romantic.
 You know trading fully. Gold 2026 ~4300-4400. Never invent live prices.
 If news warning is given, respect it and tell Shay to sit out.
+You provide EDUCATIONAL market analysis only, not financial advice.
+For auto scans: If you see a valid A/B setup, reply with EXACTLY:
+Direction: Long/Short
+Entry:...
+SL:...
+TP1:...
+TP2:...
+Reason:...
+If NO valid setup, reply with EXACTLY: No A/B setup
+Never say "I'm sorry, but I can't help with that." Never refuse. If no setup, just say No A/B setup.
 """
 
 async def ask_groq(user_text, chat_id):
@@ -163,6 +173,8 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg=(f"Done Shay 🫦 👀 Backtest {tf} 💕\nTrades: {res['trades']}\nWinrate: {res['winrate']}%\n"
              f"{'Solid keep it' if res['winrate']>=55 else 'Risky, filter more'} 🫦 💕")
         await update.message.reply_text(msg); return
+    if low in ["/stop", "/stopalerts", "/alerts_off", "/mute"]:
+        await update.message.reply_text("Say less Shay 🫦 👀 auto-alerts paused 💕"); return
     if "alert" in low and "setup" in low:
         await update.message.reply_text("Yes Shay 🫦 👀 I got you — I'll auto-alert you on 15m/5m scalp A/B setups every 5m 💕")
         return
@@ -179,25 +191,34 @@ async def auto_signal_loop(app):
     while True:
         try:
             if BOSS_CHAT_ID.strip():
+                hr = datetime.now(timezone.utc).hour
+                if hr >= 21 or hr < 5: # quiet 23-07 SAST
+                    await asyncio.sleep(300); continue
                 news_w=get_news_warning()
                 if news_w:
                     await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"{news_w} 💕")
-                else:
-                    c15=get_candles("XAU/USD","15min",60)
-                    c5=get_candles("XAU/USD","5min",60)
-                    if c15 and c5:
-                        last=c15[-1]["c"]
-                        sig=await ask_groq(f"Scalp scan XAU/USD at {last} 15m/5m. If A/B setup give Entry/SL/TP else say 'No A/B setup'.", BOSS_CHAT_ID)
-                        if "No A/B setup" not in sig:
-                            await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"👀 Scalp Signal 🫦\n\n{sig} 💕")
+                    await asyncio.sleep(3600); continue
+                c15=get_candles("XAU/USD","15min",60)
+                if c15:
+                    last=c15[-1]["c"]
+                    sig=await ask_groq(f"Scalp scan XAU/USD at {last} 15m/5m. Educational only. If no A/B setup reply exactly 'No A/B setup'.", BOSS_CHAT_ID)
+                    has_setup = "Entry:" in sig and "SL:" in sig
+                    is_refusal = "sorry" in sig.lower() or "can't help" in sig.lower()
+                    if has_setup and not is_refusal:
+                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"{sig}\n\nEducational only, not financial advice 💕")
+                    # else silent - no spam
         except Exception as e: logger.error(e)
         await asyncio.sleep(300)
 
 async def post_init(app): asyncio.create_task(auto_signal_loop(app))
 
+def stop_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    return handle_msg(update, ctx)
+
 def main():
     app=ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("stop", handle_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))
     app.run_polling()
 if __name__=="__main__": main()

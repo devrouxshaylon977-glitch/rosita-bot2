@@ -11,7 +11,7 @@ logger=logging.getLogger("Rosita")
 BOT_TOKEN=os.getenv("BOT_TOKEN",""); GROQ_API_KEY=os.getenv("GROQ_API_KEY",""); TWELVEDATA_KEY=os.getenv("TWELVEDATA_KEY",""); BOSS_CHAT_ID=os.getenv("BOSS_CHAT_ID","")
 PORT=int(os.getenv("PORT","10000") or 10000)
 client=Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=6))
+CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=10))
 ACTIVE_SIGNALS=[]; SIGNAL_ID=0; STATS={"tp1":0,"tp2":0,"sl":0,"total":0}
 PIP_SIZE={"XAU/USD":0.1,"US30/USD":1.0,"USTEC":1.0,"WTI/USD":0.01}
 web=Flask(__name__)
@@ -207,7 +207,7 @@ async def ask_groq(user_text,chat_id):
     cid=str(chat_id); HISTORY[cid].append({"role":"user","content":user_text})
     if not client: return "RATE_LIMIT_FALLBACK"
     msgs=[{"role":"system","content":SYSTEM}]
-    for m in list(HISTORY[cid])[-4:]: msgs.append(m)
+    for m in list(HISTORY[cid])[-10:]: msgs.append(m)
     try:
         r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.7,max_tokens=400)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt

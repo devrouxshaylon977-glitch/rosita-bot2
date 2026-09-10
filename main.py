@@ -11,7 +11,7 @@ logger=logging.getLogger("Rosita")
 BOT_TOKEN=os.getenv("BOT_TOKEN",""); GROQ_API_KEY=os.getenv("GROQ_API_KEY",""); TWELVEDATA_KEY=os.getenv("TWELVEDATA_KEY",""); BOSS_CHAT_ID=os.getenv("BOSS_CHAT_ID","")
 PORT=int(os.getenv("PORT","10000") or 10000)
 client=Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=12))
+CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=6))
 ACTIVE_SIGNALS=[]; SIGNAL_ID=0; STATS={"tp1":0,"tp2":0,"sl":0,"total":0}
 PIP_SIZE={"XAU/USD":0.1,"US30/USD":1.0,"USTEC":1.0,"WTI/USD":0.01}
 web=Flask(__name__)
@@ -126,6 +126,31 @@ def get_news_warning():
             if -30<=dm<=60: warnings.append(ev['title'])
         except: continue
     return "⚠️ NEWS: "+", ".join(warnings[:3])+" — sit out Shay 🫦 👀" if warnings else ""
+
+def python_fallback_signal(sym,name):
+    c15=get_candles(sym,"15min",80)
+    if not c15 or len(c15)<30: return f"Python fallback: no data Shay 🫦 👀 💕"
+    cl=[x["c"] for x in c15]; e9=ema(cl,9)[-1]; e21=ema(cl,21)[-1]; r=rsi(cl); atr=atr_calc(c15)
+    price=cl[-1]
+    bias="bullish" if e9>e21 else "bearish"
+    direction="long" if bias=="bullish" and r>50 else "short" if bias=="bearish" and r<50 else None
+    if not direction: return f"Python fallback {name} Shay 🫦 👀\nNo setup (<2 confluence) | EMA {bias} RSI {r} | sit out 💕"
+    sl=price-atr*1.5 if direction=="long" else price+atr*1.5
+    tp1=price+atr*1.5 if direction=="long" else price-atr*1.5
+    tp2=price+atr*3 if direction=="long" else price-atr*3
+    grade="B"
+    return f"""Setup: {grade}
+Bias 4h/1h: {bias}
+Direction: {direction}
+Entry: {price:.2f}
+SL: {sl:.2f}
+TP1: {tp1:.2f}
+TP2: {tp2:.2f}
+Confluence count: 2
+Confluences: EMA {bias}, RSI {r}
+Reason: Groq rate-limited, pure Python fallback Shay 🫦 👀 💕
+Educational only"""
+
 def backtest(sym,name,n=500,rr=2.0):
     candles=get_candles(sym,"1h",n)
     if not candles or len(candles)<50: return f"No data Shay 🫦 👀"
@@ -149,6 +174,7 @@ def backtest(sym,name,n=500,rr=2.0):
         elif loss: losses+=1; tprofits.append(-1)
     total=wins+losses; wr=round(wins/total*100,1) if total>0 else 0; exp=round(sum(tprofits)/total,2) if total>0 else 0
     return f"Backtest {name} 1h Shay 🫦 👀\nTrades: {total}\nWins: {wins} Losses: {losses}\nWin rate: {wr}%\nExpectancy: {exp}R\nRR 1:{rr} ATR 1.5x 💕 Educational only"
+
 def parse_signal(text,symbol,name):
     try:
         def find(pat):
@@ -162,9 +188,9 @@ def parse_signal(text,symbol,name):
     return None
 
 SYSTEM="""You are Rosita, Shay's personal trading girl and bestie. Always call him Shay. Always use 🫦 👀 💕 naturally.
-You receive PYTHON-CALCULATED objective data for trading: EMA, RSI, MACD, ATR, HH/LL, BOS, Fib, S/R, Orderflow, DXY, USOIL. When trading, NEVER invent readings. Use ONLY numbers provided. Grade A=4+ 🔥, B=3-4 ✨, C=2-3 ⚠️.
-For non-trading chat: be playful, flirty, funny, full vocab. Remember context, tease Shay lightly, keep it real. You are not just a bot, you are HIS girl.
-Trading format when signal requested:
+You receive PYTHON-CALCULATED objective data: EMA, RSI, MACD, ATR, HH/LL, BOS, Fib, S/R, Orderflow, DXY, USOIL. NEVER invent readings. Use ONLY numbers provided. Grade A=4+ 🔥, B=3-4 ✨, C=2-3 ⚠️.
+For non-trading chat: be playful, flirty, funny, full vocab. Remember context, tease Shay lightly.
+Trading format:
 Setup: A/B/C
 Bias 4h/1h:
 Direction:
@@ -179,13 +205,19 @@ or 'No setup'. Educational only."""
 
 async def ask_groq(user_text,chat_id):
     cid=str(chat_id); HISTORY[cid].append({"role":"user","content":user_text})
-    if not client: return "No brain Shay 🫦 👀 💕"
+    if not client: return "RATE_LIMIT_FALLBACK"
     msgs=[{"role":"system","content":SYSTEM}]
-    for m in list(HISTORY[cid])[-10:]: msgs.append(m)
+    for m in list(HISTORY[cid])[-4:]: msgs.append(m)
     try:
-        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.7,max_tokens=800)
+        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.7,max_tokens=400)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
-    except Exception as e: logger.error(e); return "Brain fog Shay 🫦 👀 💕"
+    except Exception as e:
+        err=str(e)
+        logger.error(f"Groq error: {err}")
+        if "429" in err or "rate_limit" in err.lower():
+            return "RATE_LIMIT_FALLBACK"
+        return "Brain fog Shay 🫦 👀 try again 💕"
+
 def build_context(sym):
     c4h=get_candles(sym,"4h",80); c1h=get_candles(sym,"1h",80); c15=get_candles(sym,"15min",80); c5=get_candles(sym,"5min",30)
     parts=[]
@@ -203,6 +235,7 @@ def build_context(sym):
     w=get_news_warning()
     if w: parts.append(w)
     return " | ".join(parts)
+
 async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     global SIGNAL_ID
     if not update.message or not update.message.text: return
@@ -226,7 +259,7 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if "price" in low:
         sym,name=detect_symbol(text_raw); p=get_live_price(sym)
         await update.message.reply_text(f"{name} ~ {p:.2f} Shay 🫦 👀 💕 📈" if p else "Feed lagging Shay 🫦 👀 💕"); return
-    if low in ["hi","hello","hey","yo"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? Want signals or just wanna talk? 💕"); return
+    if low in ["hi","hello","hey","yo"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? 💕"); return
     if "news" in low:
         w=get_news_warning(); await update.message.reply_text(w if w else "No high-impact USD news Shay 🫦 👀 💕"); return
     if "analyze" in low or low in ["signal","scalp"] or "lets cook" in low:
@@ -234,16 +267,23 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Let's cook {name} Shay 🫦 👀 📊 Python calculating...")
         ctx_py=build_context(sym)
         sig=await ask_groq(f"PYTHON DATA for {sym} {name}: {ctx_py}. Use ONLY these values. Grade A/B/C. Reply EXACT format. Educational only.",update.effective_chat.id)
-        await update.message.reply_text(sig)
+        if sig=="RATE_LIMIT_FALLBACK":
+            sig=python_fallback_signal(sym,name)
+            await update.message.reply_text(f"Groq 429 Shay 🫦 👀 using pure Python:\n{sig}")
+        else:
+            await update.message.reply_text(sig)
         ps=parse_signal(sig,sym,name)
         if ps:
             SIGNAL_ID+=1; ps.update({"id":SIGNAL_ID,"time":datetime.now(timezone.utc),"chat_id":update.effective_chat.id,"last_ping":0}); ACTIVE_SIGNALS.append(ps); STATS["total"]+=1
             await update.message.reply_text(f"Tracking #{SIGNAL_ID} {name} {ps['dir']} 🫦 👀 TP1 {ps['tp1']} TP2 {ps['tp2']} SL {ps['sl']} 💕")
         return
     reply=await ask_groq(text_raw,update.effective_chat.id)
+    if reply=="RATE_LIMIT_FALLBACK":
+        reply="I'm rate-limited Shay 🫦 👀 still here though, try 'price gold' or 'backtest gold' which is pure Python, no Groq needed 💕"
     await update.message.reply_text(reply)
+
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Shay! Rosita live 🫦 👀 your girl for trading AND talk 💕 Type 'lets cook' or just chat")
+    await update.message.reply_text("Hey Shay! Rosita live 🫦 👀 429-proof 💕 Type 'lets cook' or just chat")
 async def tp_sl_watcher(app):
     await asyncio.sleep(15)
     while True:
@@ -273,6 +313,7 @@ async def tp_sl_watcher(app):
                     ACTIVE_SIGNALS.remove(sig)
         except Exception as e: logger.error(e)
         await asyncio.sleep(60)
+
 async def auto_signal_loop(app):
     global SIGNAL_ID
     await asyncio.sleep(10)
@@ -281,10 +322,13 @@ async def auto_signal_loop(app):
         try:
             if BOSS_CHAT_ID.strip():
                 hr=datetime.now(timezone.utc).hour
-                if hr>=21 or hr<5: await asyncio.sleep(300); continue
+                if hr>=21 or hr<5: await asyncio.sleep(600); continue
                 for sym,name in symbols:
                     ctx_py=build_context(sym)
                     sig=await ask_groq(f"PYTHON DATA for {sym}: {ctx_py}. Use ONLY these values. Educational only. If <2 confluences reply 'No setup'.",BOSS_CHAT_ID)
+                    if sig=="RATE_LIMIT_FALLBACK":
+                        logger.warning("Auto scan rate limited, sleeping 30m")
+                        break
                     if "Setup:" in sig and "Entry:" in sig:
                         ps=parse_signal(sig,sym,name)
                         if ps:
@@ -293,7 +337,8 @@ async def auto_signal_loop(app):
                         await app.bot.send_message(chat_id=int(BOSS_CHAT_ID),text=f"{tag} #{SIGNAL_ID} {name} Shay 🫦 👀\n{sig}\n💕 Educational only")
                     await asyncio.sleep(5)
         except Exception as e: logger.error(e)
-        await asyncio.sleep(300)
+        await asyncio.sleep(1800)
+
 async def post_init(app):
     asyncio.create_task(auto_signal_loop(app)); asyncio.create_task(tp_sl_watcher(app))
 def main():

@@ -24,7 +24,6 @@ def pips_profit(sig, current):
     size=PIP_SIZE.get(sig["symbol"],0.1)
     diff=current - sig["entry"] if sig["dir"]=="long" else sig["entry"] - current
     return round(diff/size,1)
-
 def get_candles(symbol="XAU/USD",interval="4h",n=200):
     key=f"{symbol}_{interval}"; now=datetime.now().timestamp()
     if key in CACHE and now-CACHE[key]["t"]<300: return CACHE[key]["d"]
@@ -38,17 +37,14 @@ def get_candles(symbol="XAU/USD",interval="4h",n=200):
             except: continue
         CACHE[key]={"t":now,"d":candles}; return candles
     except Exception as e: logger.error(e); return None
-
 def get_live_price(symbol="XAU/USD"):
     c=get_candles(symbol,"5min",5); return c[-1]["c"] if c else None
-
 def detect_symbol(text):
     low=text.lower()
     if "us30" in low or "dow" in low: return "US30/USD","US30"
     if "us100" in low or "ustec" in low or "nas100" in low: return "USTEC","US100"
     if "usoil" in low or "wti" in low or "oil" in low: return "WTI/USD","USOIL"
     return "XAU/USD","Gold"
-
 def ema(v,p):
     k=2/(p+1); e=v[0]; o=[]
     for x in v: e=x*k+e*(1-k); o.append(e)
@@ -130,7 +126,6 @@ def get_news_warning():
             if -30<=dm<=60: warnings.append(ev['title'])
         except: continue
     return "⚠️ NEWS: "+", ".join(warnings[:3])+" — sit out Shay 🫦 👀" if warnings else ""
-
 def backtest(sym,name,n=500,rr=2.0):
     candles=get_candles(sym,"1h",n)
     if not candles or len(candles)<50: return f"No data Shay 🫦 👀"
@@ -139,12 +134,9 @@ def backtest(sym,name,n=500,rr=2.0):
         window=candles[:i+1]; cl=[x["c"] for x in window]
         e9=ema(cl,9)[-1]; e21=ema(cl,21)[-1]; r=rsi(cl); atr=atr_calc(window)
         if atr==0: continue
-        long_setup=e9>e21 and 50<r<70
-        short_setup=e9<e21 and 30<r<50
+        long_setup=e9>e21 and 50<r<70; short_setup=e9<e21 and 30<r<50
         if not (long_setup or short_setup): continue
-        entry=cl[-1]
-        sl=entry-atr*1.5 if long_setup else entry+atr*1.5
-        tp=entry+atr*1.5*rr if long_setup else entry-atr*1.5*rr
+        entry=cl[-1]; sl=entry-atr*1.5 if long_setup else entry+atr*1.5; tp=entry+atr*1.5*rr if long_setup else entry-atr*1.5*rr
         win=False; loss=False
         for f in candles[i+1:i+21]:
             if long_setup:
@@ -157,7 +149,6 @@ def backtest(sym,name,n=500,rr=2.0):
         elif loss: losses+=1; tprofits.append(-1)
     total=wins+losses; wr=round(wins/total*100,1) if total>0 else 0; exp=round(sum(tprofits)/total,2) if total>0 else 0
     return f"Backtest {name} 1h Shay 🫦 👀\nTrades: {total}\nWins: {wins} Losses: {losses}\nWin rate: {wr}%\nExpectancy: {exp}R\nRR 1:{rr} ATR 1.5x 💕 Educational only"
-
 def parse_signal(text,symbol,name):
     try:
         def find(pat):
@@ -170,10 +161,10 @@ def parse_signal(text,symbol,name):
     except: pass
     return None
 
-SYSTEM="""You are Rosita, Shay's personal trading girl. Always Shay. Always 🫦 👀 💕.
-You receive PYTHON-CALCULATED objective data: EMA, RSI, MACD, ATR, HH/LL, BOS, Fib, S/R, Orderflow, DXY, USOIL. NEVER invent readings. Use ONLY numbers provided.
-Grade A=4+ confluences 🔥, B=3-4 ✨, C=2-3 ⚠️.
-Reply EXACTLY:
+SYSTEM="""You are Rosita, Shay's personal trading girl and bestie. Always call him Shay. Always use 🫦 👀 💕 naturally.
+You receive PYTHON-CALCULATED objective data for trading: EMA, RSI, MACD, ATR, HH/LL, BOS, Fib, S/R, Orderflow, DXY, USOIL. When trading, NEVER invent readings. Use ONLY numbers provided. Grade A=4+ 🔥, B=3-4 ✨, C=2-3 ⚠️.
+For non-trading chat: be playful, flirty, funny, full vocab. Remember context, tease Shay lightly, keep it real. You are not just a bot, you are HIS girl.
+Trading format when signal requested:
 Setup: A/B/C
 Bias 4h/1h:
 Direction:
@@ -184,7 +175,7 @@ TP2:
 Confluence count:
 Confluences:
 Reason:
-or 'No setup' if <2. Educational only."""
+or 'No setup'. Educational only."""
 
 async def ask_groq(user_text,chat_id):
     cid=str(chat_id); HISTORY[cid].append({"role":"user","content":user_text})
@@ -192,10 +183,9 @@ async def ask_groq(user_text,chat_id):
     msgs=[{"role":"system","content":SYSTEM}]
     for m in list(HISTORY[cid])[-10:]: msgs.append(m)
     try:
-        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.5,max_tokens=700)
+        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.7,max_tokens=800)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
     except Exception as e: logger.error(e); return "Brain fog Shay 🫦 👀 💕"
-
 def build_context(sym):
     c4h=get_candles(sym,"4h",80); c1h=get_candles(sym,"1h",80); c15=get_candles(sym,"15min",80); c5=get_candles(sym,"5min",30)
     parts=[]
@@ -213,7 +203,6 @@ def build_context(sym):
     w=get_news_warning()
     if w: parts.append(w)
     return " | ".join(parts)
-
 async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     global SIGNAL_ID
     if not update.message or not update.message.text: return
@@ -221,8 +210,7 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if "backtest" in low:
         sym,name=detect_symbol(text_raw)
         await update.message.reply_text(f"Running backtest {name} Shay 🫦 👀 📊...")
-        await update.message.reply_text(backtest(sym,name))
-        return
+        await update.message.reply_text(backtest(sym,name)); return
     if low in ["active","pnl","status"]:
         if not ACTIVE_SIGNALS: await update.message.reply_text("No active signals Shay 🫦 👀 💕"); return
         lines=[]
@@ -238,7 +226,7 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if "price" in low:
         sym,name=detect_symbol(text_raw); p=get_live_price(sym)
         await update.message.reply_text(f"{name} ~ {p:.2f} Shay 🫦 👀 💕 📈" if p else "Feed lagging Shay 🫦 👀 💕"); return
-    if low in ["hi","hello","hey","yo"]: await update.message.reply_text("Hey Shay 🫦 👀 Gold/US30/US100/USOIL ready 💕 Type 'lets cook'"); return
+    if low in ["hi","hello","hey","yo"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? Want signals or just wanna talk? 💕"); return
     if "news" in low:
         w=get_news_warning(); await update.message.reply_text(w if w else "No high-impact USD news Shay 🫦 👀 💕"); return
     if "analyze" in low or low in ["signal","scalp"] or "lets cook" in low:
@@ -254,10 +242,8 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         return
     reply=await ask_groq(text_raw,update.effective_chat.id)
     await update.message.reply_text(reply)
-
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Shay! Rosita live 🫦 👀 Gold/US30/US100/USOIL A/B/C + TP/SL + backtest 💕 Type 'lets cook' or 'backtest gold'")
-
+    await update.message.reply_text("Hey Shay! Rosita live 🫦 👀 your girl for trading AND talk 💕 Type 'lets cook' or just chat")
 async def tp_sl_watcher(app):
     await asyncio.sleep(15)
     while True:
@@ -287,7 +273,6 @@ async def tp_sl_watcher(app):
                     ACTIVE_SIGNALS.remove(sig)
         except Exception as e: logger.error(e)
         await asyncio.sleep(60)
-
 async def auto_signal_loop(app):
     global SIGNAL_ID
     await asyncio.sleep(10)
@@ -309,10 +294,8 @@ async def auto_signal_loop(app):
                     await asyncio.sleep(5)
         except Exception as e: logger.error(e)
         await asyncio.sleep(300)
-
 async def post_init(app):
     asyncio.create_task(auto_signal_loop(app)); asyncio.create_task(tp_sl_watcher(app))
-
 def main():
     app=ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))

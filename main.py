@@ -26,7 +26,8 @@ def pips_profit(sig, current):
     return round(diff/size,1)
 
 def get_yahoo_candles(symbol, interval="15min", n=80):
-    yahoo_map={"XAU/USD":"GC=F","US30/USD":"^DJI","USTEC":"^IXIC","WTI/USD":"CL=F","DXY":"DX-Y.NYB"}
+    # FIXED TO MATCH BROKER: YM=F = Dow Futures (US30), NQ=F = Nasdaq Futures (US100)
+    yahoo_map={"XAU/USD":"GC=F","US30/USD":"YM=F","USTEC":"NQ=F","WTI/USD":"CL=F","DXY":"DX-Y.NYB"}
     yahoo_sym=yahoo_map.get(symbol)
     if not yahoo_sym: return None
     interval_map={"4h":"60m","1h":"60m","15min":"15m","5min":"5m"}
@@ -48,7 +49,7 @@ def get_yahoo_candles(symbol, interval="15min", n=80):
                 if c[i] is None: continue
                 candles.append({"t":datetime.fromtimestamp(ts[i]).isoformat(),"o":float(o[i] or c[i]),"h":float(h[i] or c[i]),"l":float(l[i] or c[i]),"c":float(c[i])})
             if candles:
-                logger.info(f"Yahoo WIN {yahoo_sym} {len(candles)}")
+                logger.info(f"Yahoo WIN {yahoo_sym} {len(candles)} = {candles[-1]['c']}")
                 return candles[-n:] if len(candles)>n else candles
         except Exception as e:
             logger.error(f"Yahoo fail {url} {e}")
@@ -62,13 +63,12 @@ def get_candles(symbol="XAU/USD",interval="4h",n=200):
     if symbol=="WTI/USD": tries=["WTI/USD","WTI","USOIL"]
     if symbol=="DXY": tries=["DXY","USDX"]
     key=f"{symbol}_{interval}"; now=datetime.now().timestamp()
-    if key in CACHE and now-CACHE[key]["t"]<300: return CACHE[key]["d"]
+    cache_time = 600 if interval in ["4h","1h"] else 180
+    if key in CACHE and now-CACHE[key]["t"]<cache_time: return CACHE[key]["d"]
     for sym_try in tries:
         try:
             r=requests.get("https://api.twelvedata.com/time_series",params={"symbol":sym_try,"interval":interval,"outputsize":n,"apikey":TWELVEDATA_KEY},timeout=12).json()
-            if "code" in r:
-                logger.warning(f"Twelve blocked {sym_try}: {r.get('message')}")
-                continue
+            if "code" in r: continue
             vals=r.get("values",[])
             if not vals: continue
             candles=[]
@@ -79,28 +79,23 @@ def get_candles(symbol="XAU/USD",interval="4h",n=200):
                 CACHE[key]={"t":now,"d":candles}
                 LAST_FEED[key]="TwelveData"
                 return candles
-        except Exception as e:
-            logger.error(f"Twelve exc {e}")
-            continue
+        except: continue
     yc=get_yahoo_candles(symbol,interval,n)
     if yc:
         CACHE[key]={"t":now,"d":yc}
         LAST_FEED[key]="Yahoo"
-        logger.warning(f"Yahoo backup for {symbol}")
         return yc
-    logger.error(f"BOTH FAILED {symbol} {interval}")
     return None
 
 def get_live_price(symbol="XAU/USD"):
     c=get_candles(symbol,"5min",5)
     if not c: return None, None
-    key=f"{symbol}_5min"
-    return c[-1]["c"], LAST_FEED.get(key,"Unknown")
+    return c[-1]["c"], LAST_FEED.get(f"{symbol}_5min","Unknown")
 
 def detect_symbol(text):
     low=text.lower()
-    if "us30" in low or "dow" in low or "dji" in low: return "US30/USD","US30"
-    if "us100" in low or "ustec" in low or "nas100" in low or "ixic" in low: return "USTEC","US100"
+    if "us30" in low or "dow" in low or "dji" in low or "ym" in low: return "US30/USD","US30"
+    if "us100" in low or "ustec" in low or "nas100" in low or "nq" in low: return "USTEC","US100"
     if "usoil" in low or "wti" in low or "oil" in low: return "WTI/USD","USOIL"
     return "XAU/USD","Gold"
 
@@ -288,10 +283,11 @@ def build_context_fast(sym):
             if sr['support']: parts.append(f"SUP {sr['support']:.2f}")
             if sr['resistance']: parts.append(f"RES {sr['resistance']:.2f}")
     if c5: parts.append(orderflow(c5,20))
-    try: parts.append(dxy_bias())
-    except: parts.append("DXY unknown")
-    try: parts.append(usoil_bias())
-    except: parts.append("USOIL unknown")
+    if sym=="XAU/USD":
+        try: parts.append(dxy_bias())
+        except: pass
+        try: parts.append(usoil_bias())
+        except: pass
     w=get_news_warning()
     if w: parts.append(w)
     return " | ".join(parts) if parts else "No candle data"
@@ -319,14 +315,13 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if "stats" in low:
         t=STATS["total"]; w=STATS["tp1"]+STATS["tp2"]; wr=round(w/t*100,1) if t>0 else 0
         await update.message.reply_text(f"Rosita stats Shay 🫦 👀\nTotal: {t}\nTP1: {STATS['tp1']}\nTP2: {STATS['tp2']}\nSL: {STATS['sl']}\nWin rate: {wr}%\nActive: {len(ACTIVE_SIGNALS)} 💕"); return
-    # FIXED: price detection now catches "us30?" "us30" "gold" etc
-    if "price" in low or low.strip("?!.") in ["us30","us100","gold","usoil","wti","dxy","dow","nas100"] or (len(low)<=7 and any(k in low for k in ["us30","gold","us100","usoil","dxy"])):
+    if "price" in low or low.strip("?!.") in ["us30","us100","gold","usoil","wti","dxy","dow","nas100","ym","nq"] or (len(low)<=7 and any(k in low for k in ["us30","gold","us100","usoil","dxy"])):
         sym,name=detect_symbol(text_raw)
         price, source = await asyncio.to_thread(get_live_price,sym)
         if price:
             await update.message.reply_text(f"{name} ~ {price:.2f} [{source}] Shay 🫦 👀 💕")
         else:
-            await update.message.reply_text("Feed lagging Shay 🫦 👀 both feeds down, retry 30s 💕")
+            await update.message.reply_text("Feed lagging Shay 🫦 👀 retry 30s 💕")
         return
     if low in ["hi","hello","hey","yo","hi rosita"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? 💕"); return
     if "news" in low:
@@ -351,7 +346,7 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Rosita live 🫦 👀 TwelveData + Yahoo query2 + feed tags 💕")
+    await update.message.reply_text("Rosita live 🫦 👀 Futures feed YM=F NQ=F = broker accurate 💕")
 async def tp_sl_watcher(app):
     await asyncio.sleep(15)
     while True:

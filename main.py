@@ -11,7 +11,7 @@ logger=logging.getLogger("Rosita")
 BOT_TOKEN=os.getenv("BOT_TOKEN",""); GROQ_API_KEY=os.getenv("GROQ_API_KEY",""); TWELVEDATA_KEY=os.getenv("TWELVEDATA_KEY",""); BOSS_CHAT_ID=os.getenv("BOSS_CHAT_ID","")
 PORT=int(os.getenv("PORT","10000") or 10000)
 client=Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=10))
+CACHE={}; NEWS_CACHE={"t":0,"d":[]}; HISTORY=defaultdict(lambda: deque(maxlen=10)); LAST_FEED={}
 ACTIVE_SIGNALS=[]; SIGNAL_ID=0; STATS={"tp1":0,"tp2":0,"sl":0,"total":0}
 PIP_SIZE={"XAU/USD":0.1,"US30/USD":1.0,"USTEC":1.0,"WTI/USD":0.01}
 web=Flask(__name__)
@@ -25,17 +25,50 @@ def pips_profit(sig, current):
     diff=current - sig["entry"] if sig["dir"]=="long" else sig["entry"] - current
     return round(diff/size,1)
 
+def get_yahoo_candles(symbol, interval="15min", n=80):
+    yahoo_map={"XAU/USD":"GC=F","US30/USD":"^DJI","USTEC":"^IXIC","WTI/USD":"CL=F","DXY":"DX-Y.NYB"}
+    yahoo_sym=yahoo_map.get(symbol)
+    if not yahoo_sym: return None
+    interval_map={"4h":"60m","1h":"60m","15min":"15m","5min":"5m"}
+    yahoo_interval=interval_map.get(interval,"15m")
+    y_range="1d" if n<=30 else "5d" if n<=80 else "1mo"
+    headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)","Accept":"*/*"}
+    urls=[f"https://query2.finance.yahoo.com/v8/finance/chart/{yahoo_sym}", f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_sym}"]
+    for url in urls:
+        try:
+            r=requests.get(url, params={"interval":yahoo_interval,"range":y_range}, headers=headers, timeout=10)
+            j=r.json()
+            result=j.get("chart",{}).get("result",[])
+            if not result: continue
+            data=result[0]; ts=data.get("timestamp",[]); q=data.get("indicators",{}).get("quote",[{}])[0]
+            if not ts: continue
+            o,h,l,c=q.get("open",[]),q.get("high",[]),q.get("low",[]),q.get("close",[])
+            candles=[]
+            for i in range(len(ts)):
+                if c[i] is None: continue
+                candles.append({"t":datetime.fromtimestamp(ts[i]).isoformat(),"o":float(o[i] or c[i]),"h":float(h[i] or c[i]),"l":float(l[i] or c[i]),"c":float(c[i])})
+            if candles:
+                logger.info(f"Yahoo WIN {yahoo_sym} {len(candles)}")
+                return candles[-n:] if len(candles)>n else candles
+        except Exception as e:
+            logger.error(f"Yahoo fail {url} {e}")
+            continue
+    return None
+
 def get_candles(symbol="XAU/USD",interval="4h",n=200):
-    tries = [symbol]
-    if symbol == "US30/USD": tries = ["US30/USD", "DJI/USD", "DOW/USD", "US30"]
-    if symbol == "USTEC": tries = ["USTEC", "NDX", "NASDAQ", "IXIC", "US100"]
-    if symbol == "WTI/USD": tries = ["WTI/USD", "WTI", "USOIL"]
-    if symbol == "DXY": tries = ["DXY", "USDX", "DXY/USD"]
+    tries=[symbol]
+    if symbol=="US30/USD": tries=["US30/USD","DJI/USD","DJI","US30"]
+    if symbol=="USTEC": tries=["USTEC","NDX","NASDAQ","IXIC","US100"]
+    if symbol=="WTI/USD": tries=["WTI/USD","WTI","USOIL"]
+    if symbol=="DXY": tries=["DXY","USDX"]
     key=f"{symbol}_{interval}"; now=datetime.now().timestamp()
     if key in CACHE and now-CACHE[key]["t"]<300: return CACHE[key]["d"]
     for sym_try in tries:
         try:
             r=requests.get("https://api.twelvedata.com/time_series",params={"symbol":sym_try,"interval":interval,"outputsize":n,"apikey":TWELVEDATA_KEY},timeout=12).json()
+            if "code" in r:
+                logger.warning(f"Twelve blocked {sym_try}: {r.get('message')}")
+                continue
             vals=r.get("values",[])
             if not vals: continue
             candles=[]
@@ -44,20 +77,33 @@ def get_candles(symbol="XAU/USD",interval="4h",n=200):
                 except: continue
             if candles:
                 CACHE[key]={"t":now,"d":candles}
+                LAST_FEED[key]="TwelveData"
                 return candles
         except Exception as e:
-            logger.error(f"{sym_try} error: {e}")
+            logger.error(f"Twelve exc {e}")
             continue
+    yc=get_yahoo_candles(symbol,interval,n)
+    if yc:
+        CACHE[key]={"t":now,"d":yc}
+        LAST_FEED[key]="Yahoo"
+        logger.warning(f"Yahoo backup for {symbol}")
+        return yc
+    logger.error(f"BOTH FAILED {symbol} {interval}")
     return None
 
 def get_live_price(symbol="XAU/USD"):
-    c=get_candles(symbol,"5min",5); return c[-1]["c"] if c else None
+    c=get_candles(symbol,"5min",5)
+    if not c: return None, None
+    key=f"{symbol}_5min"
+    return c[-1]["c"], LAST_FEED.get(key,"Unknown")
+
 def detect_symbol(text):
     low=text.lower()
-    if "us30" in low or "dow" in low: return "US30/USD","US30"
-    if "us100" in low or "ustec" in low or "nas100" in low: return "USTEC","US100"
+    if "us30" in low or "dow" in low or "dji" in low: return "US30/USD","US30"
+    if "us100" in low or "ustec" in low or "nas100" in low or "ixic" in low: return "USTEC","US100"
     if "usoil" in low or "wti" in low or "oil" in low: return "WTI/USD","USOIL"
     return "XAU/USD","Gold"
+
 def ema(v,p):
     k=2/(p+1); e=v[0]; o=[]
     for x in v: e=x*k+e*(1-k); o.append(e)
@@ -144,14 +190,14 @@ def python_fallback_signal(sym,name):
     c15=get_candles(sym,"15min",80)
     if not c15 or len(c15)<30: return f"Python fallback: no data Shay 🫦 👀 💕"
     cl=[x["c"] for x in c15]; e9=ema(cl,9)[-1]; e21=ema(cl,21)[-1]; r=rsi(cl); atr=atr_calc(c15)
-    price=cl[-1]
-    bias="bullish" if e9>e21 else "bearish"
+    price=cl[-1]; bias="bullish" if e9>e21 else "bearish"
     direction="long" if bias=="bullish" and r>50 else "short" if bias=="bearish" and r<50 else None
-    if not direction: return f"Python fallback {name} Shay 🫦 👀\nNo setup (<2 confluence) | EMA {bias} RSI {r} | sit out 💕"
+    src=LAST_FEED.get(f"{sym}_15min","Unknown")
+    if not direction: return f"Python fallback {name} [{src}] Shay 🫦 👀\nNo setup (<2 confluence) | EMA {bias} RSI {r} | sit out 💕"
     sl=price-atr*1.5 if direction=="long" else price+atr*1.5
     tp1=price+atr*1.5 if direction=="long" else price-atr*1.5
     tp2=price+atr*3 if direction=="long" else price-atr*3
-    return f"""Setup: B
+    return f"""Setup: B [{src}]
 Bias 4h/1h: {bias}
 Direction: {direction}
 Entry: {price:.2f}
@@ -160,13 +206,12 @@ TP1: {tp1:.2f}
 TP2: {tp2:.2f}
 Confluence count: 2
 Confluences: EMA {bias}, RSI {r}
-Reason: Groq rate-limited, pure Python fallback Shay 🫦 👀 💕
+Reason: Pure Python fallback Shay 🫦 👀 [{src}] 💕
 Educational only"""
-
 def backtest(sym,name,n=500,rr=2.0):
     candles=get_candles(sym,"1h",n)
     if not candles or len(candles)<50: return f"No data Shay 🫦 👀"
-    wins=0; losses=0; tprofits=[]
+    wins=losses=0; tprofits=[]
     for i in range(30,len(candles)-20):
         window=candles[:i+1]; cl=[x["c"] for x in window]
         e9=ema(cl,9)[-1]; e21=ema(cl,21)[-1]; r=rsi(cl); atr=atr_calc(window)
@@ -174,7 +219,7 @@ def backtest(sym,name,n=500,rr=2.0):
         long_setup=e9>e21 and 50<r<70; short_setup=e9<e21 and 30<r<50
         if not (long_setup or short_setup): continue
         entry=cl[-1]; sl=entry-atr*1.5 if long_setup else entry+atr*1.5; tp=entry+atr*1.5*rr if long_setup else entry-atr*1.5*rr
-        win=False; loss=False
+        win=loss=False
         for f in candles[i+1:i+21]:
             if long_setup:
                 if f["l"]<=sl: loss=True; break
@@ -186,7 +231,6 @@ def backtest(sym,name,n=500,rr=2.0):
         elif loss: losses+=1; tprofits.append(-1)
     total=wins+losses; wr=round(wins/total*100,1) if total>0 else 0; exp=round(sum(tprofits)/total,2) if total>0 else 0
     return f"Backtest {name} 1h Shay 🫦 👀\nTrades: {total}\nWins: {wins} Losses: {losses}\nWin rate: {wr}%\nExpectancy: {exp}R\nRR 1:{rr} ATR 1.5x 💕 Educational only"
-
 def parse_signal(text,symbol,name):
     try:
         def find(pat):
@@ -202,7 +246,6 @@ def parse_signal(text,symbol,name):
 SYSTEM="""You are Rosita, Shay's personal trading girl and bestie. Always call him Shay. Always use 🫦 👀 💕 naturally.
 You CAN send auto alerts every 30min via your auto_signal_loop when BOSS_CHAT_ID is set - never say you can't DM first or you are one-way. You are proactive.
 You receive PYTHON-CALCULATED objective data: EMA, RSI, MACD, ATR, HH/LL, BOS, Fib, S/R, Orderflow, DXY, USOIL. NEVER invent readings. Use ONLY numbers provided. Grade A=4+ 🔥, B=3-4 ✨, C=2-3 ⚠️.
-For non-trading chat: be playful, flirty, funny, full vocab. Remember context, tease Shay lightly.
 Trading format:
 Setup: A/B/C
 Bias 4h/1h:
@@ -226,21 +269,14 @@ async def ask_groq(user_text,chat_id):
             return client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.7,max_tokens=400)
         r=await asyncio.wait_for(asyncio.to_thread(do_groq), timeout=15)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
-    except asyncio.TimeoutError:
-        logger.error("Groq timeout")
-        return "RATE_LIMIT_FALLBACK"
+    except asyncio.TimeoutError: return "RATE_LIMIT_FALLBACK"
     except Exception as e:
         err=str(e)
-        logger.error(f"Groq error: {err}")
-        if "429" in err or "rate_limit" in err.lower():
-            return "RATE_LIMIT_FALLBACK"
+        if "429" in err or "rate_limit" in err.lower(): return "RATE_LIMIT_FALLBACK"
         return "Brain fog Shay 🫦 👀 try again 💕"
 
 def build_context_fast(sym):
-    c4h=get_candles(sym,"4h",80)
-    c1h=get_candles(sym,"1h",80)
-    c15=get_candles(sym,"15min",80)
-    c5=get_candles(sym,"5min",30)
+    c4h=get_candles(sym,"4h",80); c1h=get_candles(sym,"1h",80); c15=get_candles(sym,"15min",80); c5=get_candles(sym,"5min",30)
     parts=[]
     if c4h: parts.append(technical_summary(c4h,"4H"))
     if c1h: parts.append(technical_summary(c1h,"1H"))
@@ -264,56 +300,58 @@ async def handle_msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     global SIGNAL_ID
     if not update.message or not update.message.text: return
     text_raw=update.message.text.strip(); low=text_raw.lower()
-    if "auto alert" in low or "auto alerts" in low or "message me on your own" in low:
-        if BOSS_CHAT_ID.strip():
-            await update.message.reply_text("Yes Shay 🫦 👀 I got you! Auto alerts are ON every 30min for Gold/US30/US100/USOIL when setup is A/B grade. I will DM you myself when I see it 💕")
-        else:
-            await update.message.reply_text("I can Shay 🫦 👀 but BOSS_CHAT_ID isn't set in Render yet. Set it to your Telegram chat ID and I'll pop up on my own 💕")
+    if "auto alert" in low:
+        if BOSS_CHAT_ID.strip(): await update.message.reply_text("Yes Shay 🫦 👀 Auto alerts ON every 30min 💕")
+        else: await update.message.reply_text("Set BOSS_CHAT_ID Shay 🫦 👀")
         return
     if "backtest" in low:
-        sym,name=detect_symbol(text_raw)
-        await update.message.reply_text(f"Running backtest {name} Shay 🫦 👀 📊...")
+        sym,name=detect_symbol(text_raw); await update.message.reply_text(f"Running backtest {name} Shay 🫦 👀...")
         await update.message.reply_text(await asyncio.to_thread(backtest,sym,name)); return
     if low in ["active","pnl","status"]:
         if not ACTIVE_SIGNALS: await update.message.reply_text("No active signals Shay 🫦 👀 💕"); return
         lines=[]
         for s in ACTIVE_SIGNALS:
-            p=get_live_price(s["symbol"])
+            p,src=await asyncio.to_thread(get_live_price,s["symbol"])
             if not p: continue
             pp=pips_profit(s,p); emo="🟢" if pp>0 else "🔴"
-            lines.append(f"#{s['id']} {s['name']} {s['dir']} {emo} {pp:+} pips @ {p:.2f}")
+            lines.append(f"#{s['id']} {s['name']} {s['dir']} {emo} {pp:+} pips @ {p:.2f} [{src}]")
         await update.message.reply_text("Live PnL Shay 🫦 👀\n"+"\n".join(lines)+"\n💕"); return
     if "stats" in low:
         t=STATS["total"]; w=STATS["tp1"]+STATS["tp2"]; wr=round(w/t*100,1) if t>0 else 0
         await update.message.reply_text(f"Rosita stats Shay 🫦 👀\nTotal: {t}\nTP1: {STATS['tp1']}\nTP2: {STATS['tp2']}\nSL: {STATS['sl']}\nWin rate: {wr}%\nActive: {len(ACTIVE_SIGNALS)} 💕"); return
-    if "price" in low:
-        sym,name=detect_symbol(text_raw); p=await asyncio.to_thread(get_live_price,sym)
-        await update.message.reply_text(f"{name} ~ {p:.2f} Shay 🫦 👀 💕 📈" if p else "Feed lagging Shay 🫦 👀 💕"); return
-    if low in ["hi","hello","hey","yo"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? 💕"); return
+    # FIXED: price detection now catches "us30?" "us30" "gold" etc
+    if "price" in low or low.strip("?!.") in ["us30","us100","gold","usoil","wti","dxy","dow","nas100"] or (len(low)<=7 and any(k in low for k in ["us30","gold","us100","usoil","dxy"])):
+        sym,name=detect_symbol(text_raw)
+        price, source = await asyncio.to_thread(get_live_price,sym)
+        if price:
+            await update.message.reply_text(f"{name} ~ {price:.2f} [{source}] Shay 🫦 👀 💕")
+        else:
+            await update.message.reply_text("Feed lagging Shay 🫦 👀 both feeds down, retry 30s 💕")
+        return
+    if low in ["hi","hello","hey","yo","hi rosita"]: await update.message.reply_text("Hey Shay 🫦 👀 what's good? 💕"); return
     if "news" in low:
         w=await asyncio.to_thread(get_news_warning); await update.message.reply_text(w if w else "No high-impact USD news Shay 🫦 👀 💕"); return
-    if "analyze" in low or low in ["signal","scalp"] or "lets cook" in low:
+    if "analyze" in low or low in ["signal","scalp"] or "lets cook" in low or "cook" in low:
         sym,name=detect_symbol(text_raw)
         await update.message.reply_text(f"Let's cook {name} Shay 🫦 👀 📊 Python calculating...")
         ctx_py=await asyncio.to_thread(build_context_fast, sym)
         sig=await ask_groq(f"PYTHON DATA for {sym} {name}: {ctx_py}. Use ONLY these values. Grade A/B/C. Reply EXACT format. Educational only.",update.effective_chat.id)
         if sig=="RATE_LIMIT_FALLBACK":
             sig=await asyncio.to_thread(python_fallback_signal,sym,name)
-            await update.message.reply_text(f"Groq 429 Shay 🫦 👀 using pure Python:\n{sig}")
+            await update.message.reply_text(f"Groq 429 Shay 🫦 👀 using Python:\n{sig}")
         else:
             await update.message.reply_text(sig)
         ps=parse_signal(sig,sym,name)
         if ps:
             SIGNAL_ID+=1; ps.update({"id":SIGNAL_ID,"time":datetime.now(timezone.utc),"chat_id":update.effective_chat.id,"last_ping":0}); ACTIVE_SIGNALS.append(ps); STATS["total"]+=1
-            await update.message.reply_text(f"Tracking #{SIGNAL_ID} {name} {ps['dir']} 🫦 👀 TP1 {ps['tp1']} TP2 {ps['tp2']} SL {ps['sl']} 💕")
+            await update.message.reply_text(f"Tracking #{SIGNAL_ID} {name} {ps['dir']} 🫦 👀")
         return
     reply=await ask_groq(text_raw,update.effective_chat.id)
-    if reply=="RATE_LIMIT_FALLBACK":
-        reply="I'm rate-limited Shay 🫦 👀 still here though, try 'price gold' or 'backtest gold' which is pure Python, no Groq needed 💕"
+    if reply=="RATE_LIMIT_FALLBACK": reply="Rate-limited Shay 🫦 👀 try 'price gold' (Python) 💕"
     await update.message.reply_text(reply)
 
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Shay! Rosita live 🫦 👀 429-proof full 4H+DXY+USOIL 💕 Type 'lets cook'")
+    await update.message.reply_text("Rosita live 🫦 👀 TwelveData + Yahoo query2 + feed tags 💕")
 async def tp_sl_watcher(app):
     await asyncio.sleep(15)
     while True:
@@ -357,14 +395,14 @@ async def auto_signal_loop(app):
                     ctx_py=await asyncio.to_thread(build_context_fast, sym)
                     sig=await ask_groq(f"PYTHON DATA for {sym}: {ctx_py}. Use ONLY these values. Educational only. If <2 confluences reply 'No setup'.",BOSS_CHAT_ID)
                     if sig=="RATE_LIMIT_FALLBACK":
-                        logger.warning("Auto scan rate limited, sleeping 30m")
-                        break
-                    if "Setup:" in sig and "Entry:" in sig:
+                        sig=await asyncio.to_thread(python_fallback_signal,sym,name)
+                        if "No setup" in sig or "no data" in sig.lower(): await asyncio.sleep(2); continue
+                    if "Setup:" in sig and "Entry:" in sig and "No setup" not in sig:
                         ps=parse_signal(sig,sym,name)
                         if ps:
                             SIGNAL_ID+=1; ps.update({"id":SIGNAL_ID,"time":datetime.now(timezone.utc),"chat_id":int(BOSS_CHAT_ID),"last_ping":0}); ACTIVE_SIGNALS.append(ps); STATS["total"]+=1
                         tag="🔥" if "Setup: A" in sig else "✨" if "Setup: B" in sig else "⚠️"
-                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID),text=f"{tag} #{SIGNAL_ID} {name} Shay 🫦 👀\n{sig}\n💕 Educational only")
+                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID),text=f"{tag} AUTO #{SIGNAL_ID} {name} Shay 🫦 👀\n{sig}\n💕 Educational only")
                     await asyncio.sleep(5)
         except Exception as e: logger.error(e)
         await asyncio.sleep(1800)

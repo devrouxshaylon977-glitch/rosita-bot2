@@ -1,5 +1,6 @@
 flask
-python-telegram-bot==20.8
+python-telegram-bot[job-queue]==20.8
 groq
 matplotlib
 tradingview-ta
+apscheduler

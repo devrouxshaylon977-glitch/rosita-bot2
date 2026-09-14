@@ -1,4 +1,5 @@
-python-telegram-bot
-groq
-requests
 flask
+python-telegram-bot==20.7
+groq
+matplotlib
+tradingview-ta

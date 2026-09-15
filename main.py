@@ -260,7 +260,7 @@ from datetime import datetime, timezone
 from collections import defaultdict, deque
 
 from flask import Flask
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -1793,7 +1793,9 @@ Call the user Shay.
 Response style:
 - Be concise and decision-focused.
 - Keep normal signal replies under 350 words.
-- Do not repeat raw data that is already obvious from the objective result.
+- ALWAYS give separate Rosita, Magna, and Harleen breakdowns, even when the setup is invalid.
+- For an invalid setup, explain what each agent found before stating the final no-setup/veto decision.
+- Preserve important findings supplied by the Python engine; do not invent missing values.
 
 Preferred format:
 
@@ -1875,17 +1877,43 @@ def objective_text(a):
     regime = market.get("regime", {})
 
     if not a.get("valid"):
+        # Keep all three agent breakdowns available to the explanation layer,
+        # even when the objective engine rejects the setup.
+        magna_direction = m.get("direction")
+        magna_sweep = m.get("sweep")
+        magna_fvg = m.get("fvg")
+        magna_ob = m.get("order_block")
+        magna_ote = m.get("ote")
+
         return (
-            "SWARM v21.0 OBJECTIVE SCAN\n"
+            "SWARM v22.0 OBJECTIVE SCAN\n"
             f"Signal ID: {a.get('signal_id', 'N/A')}\n"
-            f"Price: {a.get('price', 'N/A')}\n"
-            f"Rosita 4H/1H: {ros.get('bias_4h')} / {ros.get('bias_1h')}\n"
-            f"Rosita direction: {ros.get('direction')}\n"
-            f"Harleen: {h.get('verdict')}\n"
+            f"Price: {a.get('price', 'N/A')}\n\n"
+            "ROSITA BREAKDOWN\n"
+            f"4H bias: {ros.get('bias_4h')}\n"
+            f"1H bias: {ros.get('bias_1h')}\n"
+            f"Direction: {ros.get('direction')}\n"
+            f"4H structure: {ros.get('structure_4h')}\n"
+            f"1H structure: {ros.get('structure_1h')}\n"
+            f"15M structure: {ros.get('structure_15m')}\n"
+            f"5M structure: {ros.get('structure_5m')}\n"
+            f"15M BOS: {ros.get('bos_15m')}\n"
+            f"15M CHoCH: {ros.get('choch_15m')}\n\n"
+            "MAGNA BREAKDOWN\n"
+            f"Candidate direction: {magna_direction}\n"
+            f"Liquidity sweep: {magna_sweep}\n"
+            f"FVG: {magna_fvg}\n"
+            f"Order block: {magna_ob}\n"
+            f"OTE: {magna_ote}\n\n"
+            "HARLEEN BREAKDOWN\n"
+            f"Verdict: {h.get('verdict')}\n"
             f"Session: {h.get('session')}\n"
+            f"News: {h.get('news')}\n"
+            f"Veto reasons: {', '.join(h.get('veto_reasons', [])) or 'None'}\n\n"
             f"Regime: {regime.get('name')}\n"
             f"Objective score: {a.get('score', 0)}/100 ({a.get('grade')})\n"
             "NO VALID SETUP\n"
+            "Reasons:\n"
             + "\n".join(f"- {x}" for x in a.get("reasons", []))
         )
 
@@ -2149,6 +2177,28 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     low = update.message.text.lower().strip()
 
+    # Menu buttons are ordinary text prompts, so they work on every Telegram client.
+    if low in ["🔎 analyze gold", "analyze gold"]:
+        low = "analyze gold"
+    elif low in ["🧠 full breakdown", "full breakdown", "breakdown"]:
+        low = "analyze gold"
+    elif low in ["🌹 rosita", "rosita"]:
+        low = "rosita"
+    elif low in ["💜 magna", "magna"]:
+        low = "magna"
+    elif low in ["🛡️ harleen", "harleen"]:
+        low = "harleen"
+    elif low in ["📰 news", "news"]:
+        low = "news"
+    elif low in ["📊 s/r", "s/r", "support resistance"]:
+        low = "support"
+    elif low in ["🌊 order flow", "order flow"]:
+        low = "orderflow"
+    elif low in ["📓 journal", "journal"]:
+        low = "journal"
+    elif low in ["🧪 backtest", "backtest"]:
+        low = "backtest"
+
     if low in ["hi", "hello", "hey", "yo"]:
         await update.message.reply_text(
             "Hey Shay 🫦 👀 Swarm v21.0 online — "
@@ -2168,6 +2218,49 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Got it Shay 🫦 👀 I'll remember 💕"
         )
+        return
+
+    if low in ["rosita", "magna", "harleen"]:
+        await update.message.reply_text("Swarm scanning — building the requested breakdown…")
+        result = analyze_market()
+        ros = result.get("rosita", {})
+        magna = result.get("magna", {})
+        harleen = result.get("harleen", {})
+
+        if low == "rosita":
+            reply = (
+                "🌹 ROSITA BREAKDOWN\n"
+                f"4H bias: {ros.get('bias_4h')}\n"
+                f"1H bias: {ros.get('bias_1h')}\n"
+                f"Direction: {ros.get('direction')}\n"
+                f"4H structure: {ros.get('structure_4h')}\n"
+                f"1H structure: {ros.get('structure_1h')}\n"
+                f"15M structure: {ros.get('structure_15m')}\n"
+                f"5M structure: {ros.get('structure_5m')}\n"
+                f"15M BOS: {ros.get('bos_15m')}\n"
+                f"15M CHoCH: {ros.get('choch_15m')}"
+            )
+        elif low == "magna":
+            reply = (
+                "💜 MAGNA BREAKDOWN\n"
+                f"Direction: {magna.get('direction')}\n"
+                f"Liquidity sweep: {magna.get('sweep')}\n"
+                f"FVG: {magna.get('fvg')}\n"
+                f"Order block: {magna.get('order_block')}\n"
+                f"OTE: {magna.get('ote')}\n"
+                f"Score: {result.get('score')}/100 ({result.get('grade')})"
+            )
+        else:
+            reply = (
+                "🛡️ HARLEEN BREAKDOWN\n"
+                f"Verdict: {harleen.get('verdict')}\n"
+                f"Session: {harleen.get('session')}\n"
+                f"News: {harleen.get('news')}\n"
+                f"Veto reasons: {', '.join(harleen.get('veto_reasons', [])) or 'None'}\n"
+                f"Overall valid: {result.get('valid')}"
+            )
+
+        await update.message.reply_text(reply, reply_markup=MENU_KEYBOARD)
         return
 
     if "news" in low:
@@ -2276,18 +2369,42 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply)
 
+MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🔎 Analyze Gold", "🧠 Full Breakdown"],
+        ["🌹 Rosita", "💜 Magna", "🛡️ Harleen"],
+        ["📰 News", "📊 S/R", "🌊 Order Flow"],
+        ["📓 Journal", "🧪 Backtest"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Rosita + Harleen Quinzel + Magna online 🫦 👀 💕\n"
         "Objective Python engine active.\n\n"
-        "Commands:\n"
-        "analyze gold — objective multi-timeframe analysis\n"
-        "news — high-impact USD check\n"
-        "backtest — historical research test\n"
-        "journal — scan/journal statistics\n"
-        "orderflow — inspect latest order-flow proxy\n"
-        "support — inspect support/resistance + psychological levels\n\n"
-        "Manual/educational mode only."
+        "Choose an option below, or use /menu anytime.\n"
+        "Manual/educational mode only.",
+        reply_markup=MENU_KEYBOARD,
+    )
+
+
+async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 SWARM MENU\n\n"
+        "🔎 Analyze Gold — full objective scan\n"
+        "🧠 Full Breakdown — Rosita + Magna + Harleen\n"
+        "🌹 Rosita — trend/structure breakdown\n"
+        "💜 Magna — setup/confluence breakdown\n"
+        "🛡️ Harleen — veto/news/session decision\n"
+        "📰 News — high-impact USD check\n"
+        "📊 S/R — support/resistance levels\n"
+        "🌊 Order Flow — OHLCV pressure proxy\n"
+        "📓 Journal — scan statistics\n"
+        "🧪 Backtest — historical research",
+        reply_markup=MENU_KEYBOARD,
     )
 
 # ============================================================
@@ -2336,6 +2453,16 @@ async def auto_signal_loop(app):
         await asyncio.sleep(300)
 
 async def post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Open the Swarm menu"),
+        BotCommand("menu", "Show analysis menu"),
+        BotCommand("analyze", "Analyze gold"),
+        BotCommand("news", "Check USD news"),
+        BotCommand("orderflow", "Order-flow proxy"),
+        BotCommand("support", "Support and resistance"),
+        BotCommand("journal", "Journal statistics"),
+        BotCommand("backtest", "Historical research"),
+    ])
     asyncio.create_task(auto_signal_loop(app))
 
 # ============================================================
@@ -2357,6 +2484,13 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("analyze", handle_msg))
+    app.add_handler(CommandHandler("news", handle_msg))
+    app.add_handler(CommandHandler("orderflow", handle_msg))
+    app.add_handler(CommandHandler("support", handle_msg))
+    app.add_handler(CommandHandler("journal", handle_msg))
+    app.add_handler(CommandHandler("backtest", handle_msg))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg)
     )

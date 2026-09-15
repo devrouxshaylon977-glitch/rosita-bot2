@@ -253,6 +253,8 @@ import logging
 import requests
 import threading
 import json
+import base64
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 import math
 import uuid
@@ -271,7 +273,7 @@ from telegram.ext import (
 from groq import Groq
 
 # ============================================================
-# SWARM v21.0 — ROSITA + HARLEEN QUINZEL + MAGNA
+# SWARM v22.0 — ROSITA + HARLEEN QUINZEL + MAGNA
 # Objective Python market engine + Groq explanation layer
 #
 # IMPORTANT:
@@ -288,7 +290,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Swarm19")
+logger = logging.getLogger("Swarm22")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -299,6 +301,7 @@ PORT = int(os.getenv("PORT", "10000") or 10000)
 MEM_FILE = "rosita_memory.json"
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
 CACHE = {}
 NEWS_CACHE = {"t": 0, "d": []}
@@ -370,7 +373,7 @@ web = Flask(__name__)
 
 @web.route("/")
 def health():
-    return "Swarm v21.0 Rosita + Harleen Quinzel + Magna — objective engine alive", 200
+    return "Swarm v22.0 Rosita + Harleen Quinzel + Magna — objective engine alive", 200
 
 def run_flask():
     web.run(host="0.0.0.0", port=PORT, use_reloader=False)
@@ -1760,7 +1763,7 @@ def analyze_market():
 # ============================================================
 
 SYSTEM = """
-You are SWARM v21.0 — three girls in one brain, backed by an objective Python referee.
+You are SWARM v22.0 — three girls in one brain, backed by an objective Python referee.
 
 ALWAYS include: 🫦 👀 💕
 
@@ -1865,6 +1868,174 @@ async def ask_groq(user_text, chat_id):
         return f"Brain fog Shay 🫦 👀 {e} 💕"
 
 # ============================================================
+# TELEGRAM SCREENSHOT / CHART VISION
+# ============================================================
+
+VISION_SYSTEM = """
+You are the visual-analysis layer of SWARM v22.0.
+The user may send a screenshot of an XAU/USD chart, broker quote panel,
+technical-analysis chart, or related market screen.
+
+Analyze ONLY what is actually visible and legible in the image. Never invent
+prices, candles, indicators, timeframes, support/resistance, entry, SL, TP,
+news, or order-flow data that cannot be read from the screenshot.
+
+FIRST classify the screenshot (one or more):
+- PRICE CHART: candlesticks/line chart with price and time.
+- ORDER-FLOW / FOOTPRINT: bid x ask or buy/sell volume printed at individual
+  price levels inside candles, footprint numbers, delta, stacked imbalance,
+  POC, VAH/VAL, or similar footprint data.
+- VOLUME PROFILE: horizontal volume-at-price distribution, POC, VAH, VAL,
+  high/low-volume nodes.
+- DOM / ORDER BOOK: bid/ask depth, resting liquidity, market depth, ladder.
+- CVD / DELTA: cumulative delta, bar delta, aggressive buy/sell volume.
+- QUOTES: bid, ask, spread, last price or broker quote panel.
+- NEWS / CALENDAR: economic events or scheduled releases.
+- MIXED: more than one of the above.
+
+ORDER-FLOW READING RULES:
+- If a true footprint/order-flow chart is visible, read the actual bid/ask,
+  delta, imbalance, POC/value-area or absorption information shown on it.
+- Distinguish bid/ask volume from ordinary candle volume. Do NOT call ordinary
+  OHLCV volume, a volume histogram, or the bot's OHLCV pressure calculation
+  'true order flow'.
+- Look for visible clues such as buy/sell imbalance, stacked imbalance,
+  absorption, exhaustion, initiative buying/selling, trapped traders, delta
+  divergence, POC migration, value-area acceptance/rejection, and liquidity
+  concentration — ONLY when the chart actually displays enough information.
+- For DOM/order-book screenshots, describe visible resting bids/asks and
+  liquidity walls carefully, but do not claim they will remain or be executed.
+- If the screenshot does not contain the relevant order-flow fields, say
+  'order-flow data not visible' rather than estimating it from candles.
+- Never infer exact bid/ask volume, delta or CVD from a normal candlestick chart.
+
+Return a concise but useful breakdown with these sections:
+
+📷 SCREENSHOT READ
+- Symbol/instrument (if visible)
+- Timeframe (if visible)
+- Visible price/quote (if visible)
+- Indicators/markings visible
+
+🌹 ROSITA — VISUAL STRUCTURE
+- Trend/bias visible on the chart
+- Market structure / BOS / CHoCH if visibly supported
+- Key visible levels
+
+💜 MAGNA — VISUAL SETUP
+- Liquidity sweep if visible
+- FVG/imbalance if visible
+- Order-block candidate if visibly supported
+- OTE/fib information only if visible
+
+🛡️ HARLEEN — RISK CHECK
+- Visible volatility/context
+- Conflicts or missing information
+- Whether the screenshot alone is sufficient for a setup
+
+VERDICT
+- Valid visual setup / watchlist only / insufficient data
+
+Important: this is screenshot-only analysis. Do not pretend the image provides
+real-time market data, news, or true bid/ask order flow. If a quote or level is
+blurry, cropped, or ambiguous, say so instead of guessing.
+"""
+
+async def analyze_screenshot(update, image_bytes, mime_type="image/jpeg"):
+    """Analyze a Telegram chart screenshot with Groq's vision model."""
+    if not client:
+        await update.message.reply_text(
+            "📷 Screenshot received, but the vision brain is unavailable. "
+            "Add GROQ_API_KEY first 🫦 👀"
+        )
+        return
+
+    if not image_bytes:
+        await update.message.reply_text("I couldn't read that image. Please resend the screenshot.")
+        return
+
+    # Keep requests safely below Groq's documented image request limit.
+    if len(image_bytes) > 18 * 1024 * 1024:
+        await update.message.reply_text(
+            "That screenshot is too large. Please send a smaller/compressed image (under 18 MB)."
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    caption = (update.message.caption or "").strip()
+    user_prompt = (
+        "Analyze this screenshot for a manual/educational XAU/USD-style chart review. "
+        "First classify what kind of market screenshot it is (price chart, footprint/order-flow, "
+        "volume profile, DOM/order book, CVD/delta, quotes, news/calendar, or mixed). "
+        "If it is an order-flow/footprint chart, prioritize the actual bid/ask and delta information "
+        "visible in the image and explain the strongest readable imbalances/absorption/POC/value-area clues. "
+        "If it is a normal candlestick chart, do not manufacture order-flow numbers. "
+        "Read visible chart data carefully and mark anything cropped, blurry, or ambiguous as unknown. "
+        "If the screenshot is not a chart, explain what market information is actually visible.\n\n"
+        f"User note: {caption or 'No additional note.'}"
+    )
+
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{encoded}"
+
+    try:
+        r = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": VISION_SYSTEM},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            temperature=0.1,
+            max_completion_tokens=900,
+        )
+        reply = r.choices[0].message.content.strip()
+        await update.message.reply_text(
+            reply + "\n\n📷 Screenshot-only analysis — live price/news/order-flow are not assumed.",
+            reply_markup=MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error("Vision analysis error: %s", e)
+        await update.message.reply_text(
+            "📷 I received the screenshot but couldn't analyze it right now. "
+            f"Vision error: {e}"
+        )
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    try:
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            tg_file = await photo.get_file()
+            buf = BytesIO()
+            await tg_file.download_to_memory(out=buf)
+            image_bytes = buf.getvalue()
+            mime_type = "image/jpeg"
+        elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+            tg_file = await update.message.document.get_file()
+            buf = BytesIO()
+            await tg_file.download_to_memory(out=buf)
+            image_bytes = buf.getvalue()
+            mime_type = update.message.document.mime_type or "image/jpeg"
+        else:
+            return
+
+        await analyze_screenshot(update, image_bytes, mime_type)
+    except Exception as e:
+        logger.error("Telegram image download error: %s", e)
+        await update.message.reply_text(
+            "📷 I couldn't download that image. Please send the screenshot again."
+        )
+
+# ============================================================
 # FORMAT OBJECTIVE RESULT
 # ============================================================
 
@@ -1918,7 +2089,7 @@ def objective_text(a):
         )
 
     return (
-        "SWARM v21.0 OBJECTIVE SCAN\n"
+        "SWARM v22.0 OBJECTIVE SCAN\n"
         f"Signal ID: {a['signal_id']}\n"
         f"Price: {a['price']}\n"
         f"Rosita 4H/1H: {ros.get('bias_4h')} / {ros.get('bias_1h')}\n"
@@ -1976,7 +2147,7 @@ def format_journal_stats():
     s = journal_stats()
     grades = ", ".join(f"{k}: {v}" for k, v in sorted(s["grades"].items())) or "none"
     return (
-        "SWARM v21.0 JOURNAL\n"
+        "SWARM v22.0 JOURNAL\n"
         f"Scans recorded: {s['total_scans']}\n"
         f"Valid setups recorded: {s['valid_setups']}\n"
         f"Resolved trades: {s['resolved']}\n"
@@ -2196,12 +2367,14 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         low = "orderflow"
     elif low in ["📓 journal", "journal"]:
         low = "journal"
+    elif low in ["📷 chart screenshot", "chart screenshot", "screenshot", "chart"]:
+        low = "screenshot"
     elif low in ["🧪 backtest", "backtest"]:
         low = "backtest"
 
     if low in ["hi", "hello", "hey", "yo"]:
         await update.message.reply_text(
-            "Hey Shay 🫦 👀 Swarm v21.0 online — "
+            "Hey Shay 🫦 👀 Swarm v22.0 online — "
             "Rosita + Harleen Quinzel + Magna + objective Python engine 💕"
         )
         return
@@ -2263,6 +2436,28 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, reply_markup=MENU_KEYBOARD)
         return
 
+    if low == "screenshot":
+        await update.message.reply_text(
+            "📷 CHART SCREENSHOT GUIDE\n\n"
+            "For the BEST full analysis, send these screenshots:\n\n"
+            "1️⃣ 4H chart — full chart + price scale\n"
+            "2️⃣ 1H chart — full chart + price scale\n"
+            "3️⃣ 15M chart — full chart + price scale\n"
+            "4️⃣ 5M chart — full chart + price scale\n\n"
+            "OPTIONAL 📌\n"
+            "5️⃣ Quotes panel — current bid/ask or live quote\n"
+            "6️⃣ Indicators panel — if indicators aren't visible on the chart\n"
+            "7️⃣ Economic calendar/news — if you want Harleen to assess visible events\n\n"
+            "⚡ You do NOT need all 7. For a full Rosita + Magna + Harleen breakdown, "
+            "start with 4H + 1H + 15M + 5M.\n\n"
+            "📱 You can send the screenshots one after another. I’ll analyze what is "
+            "actually visible and tell you if anything important is missing or unreadable.\n\n"
+            "💡 Tip: Keep the price scale visible and avoid cropping out the candles.\n"
+            "Add a caption if useful, e.g. 'XAU/USD 5M'.",
+            reply_markup=MENU_KEYBOARD,
+        )
+        return
+
     if "news" in low:
         warning = get_news_warning()
 
@@ -2300,7 +2495,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sr = a.get("market", {}).get("support_resistance", {})
         psy = a.get("market", {}).get("psychological_levels", {})
         await update.message.reply_text(
-            "SWARM v21.0 S/R + PSYCHOLOGICAL LEVELS\n"
+            "SWARM v22.0 S/R + PSYCHOLOGICAL LEVELS\n"
             f"Price: {a.get('price')}\n"
             f"Nearest 15M S/R: {sr.get('nearest')}\n"
             f"Psychological major: {psy.get('nearest_major')}\n"
@@ -2313,7 +2508,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         a = analyze_market()
         flow = a.get("market", {}).get("order_flow_proxy", {})
         await update.message.reply_text(
-            "SWARM v21.0 ORDER-FLOW PROXY\n"
+            "SWARM v22.0 ORDER-FLOW PROXY\n"
             f"Signal ID: {a.get('signal_id')}\n"
             f"Bias: {flow.get('bias')}\n"
             f"Imbalance: {flow.get('imbalance')}\n"
@@ -2345,7 +2540,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = backtest_engine(candles)
 
         await update.message.reply_text(
-            "SWARM v21.0 RESEARCH BACKTEST\n"
+            "SWARM v22.0 RESEARCH BACKTEST\n"
             f"Trades: {result['trades']}\n"
             f"Wins: {result['wins']}\n"
             f"Losses: {result['losses']}\n"
@@ -2374,7 +2569,7 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔎 Analyze Gold", "🧠 Full Breakdown"],
         ["🌹 Rosita", "💜 Magna", "🛡️ Harleen"],
         ["📰 News", "📊 S/R", "🌊 Order Flow"],
-        ["📓 Journal", "🧪 Backtest"],
+        ["📷 Chart Screenshot", "📓 Journal", "🧪 Backtest"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -2403,6 +2598,7 @@ async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📊 S/R — support/resistance levels\n"
         "🌊 Order Flow — OHLCV pressure proxy\n"
         "📓 Journal — scan statistics\n"
+        "📷 Chart Screenshot — send a chart/quote screenshot for visual analysis\n"
         "🧪 Backtest — historical research",
         reply_markup=MENU_KEYBOARD,
     )
@@ -2461,6 +2657,7 @@ async def post_init(app):
         BotCommand("orderflow", "Order-flow proxy"),
         BotCommand("support", "Support and resistance"),
         BotCommand("journal", "Journal statistics"),
+        BotCommand("screenshot", "Analyze a chart screenshot"),
         BotCommand("backtest", "Historical research"),
     ])
     asyncio.create_task(auto_signal_loop(app))
@@ -2490,13 +2687,16 @@ def main():
     app.add_handler(CommandHandler("orderflow", handle_msg))
     app.add_handler(CommandHandler("support", handle_msg))
     app.add_handler(CommandHandler("journal", handle_msg))
+    app.add_handler(CommandHandler("screenshot", handle_msg))
     app.add_handler(CommandHandler("backtest", handle_msg))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg)
     )
 
     print(
-        "Swarm v21.0 Rosita + Harleen Quinzel + Magna "
+        "Swarm v22.0 Rosita + Harleen Quinzel + Magna "
         "objective engine starting..."
     )
 

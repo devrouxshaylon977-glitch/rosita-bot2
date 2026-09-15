@@ -1005,15 +1005,22 @@ def market_regime(candles, atr_period=14, trend_period=50):
     a = atr(candles, atr_period)
     avg_r = average_range(candles, atr_period)
     closes = [c["c"] for c in candles]
-    fast = ema(closes, 9)
-    slow = ema(closes, 21)
-    base = ema(closes, trend_period)
+    fast_series = ema(closes, 9)
+    slow_series = ema(closes, 21)
+    base_series = ema(closes, trend_period)
+
+    # EMA() returns a full series.  The regime classifier needs the latest
+    # scalar values; subtracting the series themselves caused the deployed
+    # auto loop error: "list" - "list".
+    fast = fast_series[-1] if fast_series else None
+    slow = slow_series[-1] if slow_series else None
+    base = base_series[-1] if base_series else None
 
     if None in (a, avg_r, fast, slow, base) or base == 0:
         return {"name": "unknown", "trend_strength": 0, "volatility": "unknown"}
 
-    trend_gap = abs(fast - slow) / base
-    volatility_ratio = a / base
+    trend_gap = abs(float(fast) - float(slow)) / float(base)
+    volatility_ratio = float(a) / float(base)
 
     if trend_gap >= 0.0025:
         trend = "trending"
@@ -1271,16 +1278,19 @@ def momentum_confluence(candles):
         return {"bias": "unknown", "adx_proxy": 0, "rsi": 50, "ema_slope": 0}
 
     closes = [c["c"] for c in candles]
-    e9 = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
+    e9_series = ema(closes, 9)
+    e21_series = ema(closes, 21)
+    e50_series = ema(closes, 50)
+    e9 = e9_series[-1] if e9_series else None
+    e21 = e21_series[-1] if e21_series else None
+    e50 = e50_series[-1] if e50_series else None
     r = rsi(closes, 14) if "rsi" in globals() else None
 
     # Simple deterministic directional-strength proxy.
     atr_v = atr(candles, 14)
     adx_proxy = 0
-    if atr_v and e50:
-        adx_proxy = abs(e9 - e21) / atr_v * 10
+    if atr_v and e50 is not None and e9 is not None and e21 is not None:
+        adx_proxy = abs(float(e9) - float(e21)) / float(atr_v) * 10
 
     slope = 0
     if len(closes) >= 10:
@@ -2297,11 +2307,8 @@ async def auto_signal_loop(app):
                     await asyncio.sleep(300)
                     continue
 
-                # Harleen vetoes before the engine generates a signal.
-                if get_news_warning():
-                    await asyncio.sleep(1800)
-                    continue
-
+                # analyze_market() already fetches the news veto in parallel
+                # with market data. Do not call it a second time here.
                 result = analyze_market()
 
                 if result.get("valid"):

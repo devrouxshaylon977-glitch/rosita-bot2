@@ -6,6 +6,12 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
 
+# --- FIX for Python 3.14.3 Render: force event loop ---
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Swarm17")
 
@@ -32,10 +38,8 @@ def save_mem():
 web = Flask(__name__)
 @web.route("/")
 def h(): return "Swarm v17.1 Rosita+Harleen+Magna - Alive", 200
-
 def run_flask():
     web.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
 threading.Thread(target=run_flask, daemon=True).start()
 
 def get_candles(symbol="XAU/USD", interval="4h", n=200):
@@ -49,9 +53,7 @@ def get_candles(symbol="XAU/USD", interval="4h", n=200):
         candles=[{"t":v["datetime"],"o":float(v["open"]),"h":float(v["high"]),"l":float(v["low"]),"c":float(v["close"])} for v in reversed(vals)]
         CACHE[key]={"t":now,"d":candles}
         return candles
-    except Exception as e:
-        logger.error(f"candles error {e}")
-        return None
+    except: return None
 
 def get_live_price(): c=get_candles("XAU/USD","5min",5); return c[-1]["c"] if c else None
 def ema(values, period):
@@ -84,24 +86,13 @@ def get_news_warning():
     return "⚠️ HIGH IMPACT USD: "+",".join(warns[:3])+" — Harleen says sit out" if warns else ""
 
 SYSTEM = """You are SWARM v17.1 - Three girls in one brain. ALWAYS include 🫦 👀 💕
-**ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry. Trend continuation.
-**HARLEEN QUINZEL (Risk/Azariah)** - The veto. Checks news filter, session (London/NY killzones 8-11am EST, 1:30-4pm EST), spread, ATR risk. She can VETO a trade. If news warning present, she MUST veto. No auto-trade, manual only.
-**MAGNA (Sniper/Nora)** - Reversal specialist. Looks for liquidity sweep, stop hunt, BOS/CHoCH, Order Block, FVG, Fib OTE 61.8-79%, premium/discount.
-Gold 2026 ~4300-4400. Never invent live price, use price given.
-Your job: When asked to analyze, do internal debate then final signal.
-Format EXACTLY if valid:
-Bias 4h/1h: [Rosita]
-Harleen Verdict: [PASS or VETO + reason]
-Magna Snipe: [OTE / sweep / FVG if seen]
-Direction: Long/Short
-Entry: x.xx
-SL: x.xx
-TP1-TP10 Ladder: [list 10 TPs like his 5x3 matrix - compact, 2 rows]
-Reason: Setup A/B/C + confluences
-Confluences: bullet list of 3-5
-If NO valid setup: reply EXACTLY: No A/B/C setup - Harleen vetoed / no confluence
-You provide EDUCATIONAL analysis only, not financial advice. Manual execution only, you never trade.
-Always call user Shay.
+**ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry.
+**HARLEEN QUINZEL (Risk/Azariah)** - Veto. Checks news filter, session (London/NY killzones 8-11am EST, 1:30-4pm EST), spread, ATR risk. She can VETO. If news warning present, MUST veto. Manual only.
+**MAGNA (Sniper/Nora)** - Reversal: sweep, BOS/CHoCH, OB, FVG, Fib OTE 61.8-79%.
+Gold 2026 ~4300-4400. Never invent live price.
+Format if valid: Bias 4h/1h, Harleen Verdict, Magna Snipe, Direction, Entry, SL, TP1-TP10 Ladder, Reason, Confluences.
+If NO setup: No A/B/C setup - Harleen vetoed / no confluence
+Educational only, manual execution. Always call user Shay.
 """
 
 async def ask_groq(user_text, chat_id):
@@ -134,7 +125,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fib=fib_levels(c15,50)
         if fib: ctx_top+=f" | Fib H {fib['high']:.2f} L {fib['low']:.2f} OTE 61.8 {fib['0.618']:.2f} 65 {fib['0.65']:.2f} 70.5 {fib['0.705']:.2f} 79 {fib['0.79']:.2f}"
         news_w=get_news_warning()
-        sig=await ask_groq(f"Top-down XAU/USD scalp. {ctx_top}. News: {news_w}. Live {get_live_price()}. Do internal Rosita->Harleen->Magna debate then final output in required format. Manual only, no auto-trade. Educational.", update.effective_chat.id)
+        sig=await ask_groq(f"Top-down XAU/USD scalp. {ctx_top}. News: {news_w}. Live {get_live_price()}. Do Rosita->Harleen->Magna debate then final format. Manual only.", update.effective_chat.id)
         await update.message.reply_text(sig); return
     p=get_live_price(); price_ctx=f"\n[Live XAU/USD: {p:.2f}]" if p else ""
     reply=await ask_groq(update.message.text+price_ctx, update.effective_chat.id)
@@ -165,6 +156,9 @@ async def auto_signal_loop(app):
 async def post_init(app): asyncio.create_task(auto_signal_loop(app))
 
 def main():
+    # Second safety for 3.14
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))

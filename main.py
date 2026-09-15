@@ -27,7 +27,7 @@ def v22_score_bonus(direction, market):
         bonus += 1
 
     # Reward objective 5M S/R presence without assuming direction.
-    if market.get("support_resistance", {}).get("5M"):
+    if market.get("support_resistance", {}).get("5m"):
         bonus += 1
 
     return min(bonus, 12)
@@ -45,7 +45,7 @@ SESSION_WINDOWS_UTC = {
 }
 
 def _candle_ts(c):
-    return c.get("datetime") or c.get("time") or c.get("timestamp")
+    return c.get("t") or c.get("datetime") or c.get("time") or c.get("timestamp")
 
 def _hour_utc(c):
     try:
@@ -65,7 +65,7 @@ def previous_period_levels(candles):
         try:
             ts = str(_candle_ts(c)).replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts)
-            rows.append((dt, float(c["high"]), float(c["low"]), float(c["close"])))
+            rows.append((dt, float(c["h"]), float(c["l"]), float(c["c"])))
         except Exception:
             continue
     if not rows:
@@ -106,7 +106,7 @@ def session_levels(candles):
             inside = start_h <= h < end_h if start_h < end_h else (h >= start_h or h < end_h)
             if inside:
                 try:
-                    subset.append((float(c["high"]), float(c["low"])))
+                    subset.append((float(c["h"]), float(c["l"])))
                 except Exception:
                     pass
         if subset:
@@ -173,7 +173,7 @@ def divergence_detection(candles, indicator_values, lookback=100):
     inds = []
     for c, ind in zip(candles[-n:], indicator_values[-n:]):
         try:
-            prices.append(float(c["close"]))
+            prices.append(float(c["c"]))
             inds.append(float(ind))
         except Exception:
             prices.append(None)
@@ -225,9 +225,9 @@ def break_retest_confirmation(candles, level, direction, atr_value=None):
         lev = float(level)
         tol = float(atr_value) * 0.20 if atr_value else max(lev * 0.0005, 0.25)
         recent = candles[-12:]
-        closes = [float(c["close"]) for c in recent]
-        highs = [float(c["high"]) for c in recent]
-        lows = [float(c["low"]) for c in recent]
+        closes = [float(c["c"]) for c in recent]
+        highs = [float(c["h"]) for c in recent]
+        lows = [float(c["l"]) for c in recent]
         if direction.upper() == "LONG":
             broke = any(x > lev + tol for x in closes[:-2])
             retest = any(abs(x - lev) <= tol or lo <= lev + tol for x, lo in zip(closes[-3:], lows[-3:]))
@@ -253,6 +253,7 @@ import logging
 import requests
 import threading
 import json
+from concurrent.futures import ThreadPoolExecutor
 import math
 import uuid
 from datetime import datetime, timezone
@@ -301,6 +302,8 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 CACHE = {}
 NEWS_CACHE = {"t": 0, "d": []}
+ANALYSIS_CACHE = {"t": 0, "d": None}
+ANALYSIS_CACHE_TTL = 10
 HISTORY = defaultdict(lambda: deque(maxlen=12))
 LOCK = threading.Lock()
 
@@ -462,6 +465,44 @@ def ema(values, period):
         out.append(e)
 
     return out
+
+def rsi_series(values, period=14):
+    """Return a Wilder-style RSI series aligned to input values."""
+    if not values:
+        return []
+    vals = [float(v) for v in values]
+    if len(vals) <= period:
+        return []
+
+    gains = []
+    losses = []
+    for i in range(1, len(vals)):
+        change = vals[i] - vals[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    out = [None] * period
+
+    def calc(g, l):
+        if l == 0:
+            return 100.0 if g > 0 else 50.0
+        rs = g / l
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    out.append(calc(avg_gain, avg_loss))
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        out.append(calc(avg_gain, avg_loss))
+    return out
+
+def rsi(values, period=14):
+    """Return the latest RSI value."""
+    series = rsi_series(values, period)
+    valid = [x for x in series if x is not None]
+    return valid[-1] if valid else None
 
 def true_ranges(candles):
     if not candles:
@@ -1293,7 +1334,7 @@ def premium_discount(candles, lookback=60):
 def quality_score(direction, price, c15, c5, bias4, bias1, s15, s5,
                   sweep, fvg, ob, fib, regime, levels, flow=None,
                   momentum=None, pd=None, sr=None, psy=None,
-                  sr_near=None, sr_aligned=False):
+                  sr_near=None, sr_aligned=False, market=None):
     """
     V20 expanded confluence model.
     Maximum = 100. Numbers are deterministic weights, not probabilities.
@@ -1340,12 +1381,14 @@ def quality_score(direction, price, c15, c5, bias4, bias1, s15, s5,
             points += weight
             reasons.append(label)
 
-    # v22: advanced-level confirmation bonus (capped by helper)
-    try:
-        score += v22_score_bonus(direction, market)
-        score = min(100, score)
-    except Exception:
-        pass
+    # v22: advanced-level confirmation bonus (capped by helper).
+    # This used to reference undefined local variables and was silently
+    # swallowed by an exception handler, so v22 scoring never applied.
+    market = market or {}
+    bonus = v22_score_bonus(direction, market)
+    if bonus:
+        points += bonus
+        reasons.append(f"v22 advanced confluence +{bonus}")
 
     return min(points, 100), reasons
 
@@ -1392,11 +1435,25 @@ def risk_engine(direction, price, s5, c5, atr_value):
     }
 
 def analyze_market():
-    c4h = get_candles("XAU/USD", "4h", 160)
-    c1h = get_candles("XAU/USD", "1h", 160)
-    c15 = get_candles("XAU/USD", "15min", 220)
-    c5 = get_candles("XAU/USD", "5min", 140)
+    # Reuse a very recent completed scan so repeated Telegram commands do not
+    # hit the data provider again. Ten seconds is short enough for manual use.
+    now_ts = datetime.now().timestamp()
+    if ANALYSIS_CACHE["d"] is not None and now_ts - ANALYSIS_CACHE["t"] < ANALYSIS_CACHE_TTL:
+        return ANALYSIS_CACHE["d"]
 
+    # Fetch market data and news concurrently. Previously the four candle
+    # requests and news request were partly serialized, increasing latency.
+    requests_to_fetch = [("4h", 160), ("1h", 160), ("15min", 220), ("5min", 140)]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        candle_futures = [
+            pool.submit(get_candles, "XAU/USD", interval, n)
+            for interval, n in requests_to_fetch
+        ]
+        news_future = pool.submit(get_news_warning)
+        results = [f.result() for f in candle_futures]
+        news = news_future.result()
+
+    c4h, c1h, c15, c5 = results
     if not all([c4h, c1h, c15, c5]):
         return {"valid": False, "reason": "Insufficient market data"}
 
@@ -1442,7 +1499,6 @@ def analyze_market():
     ob = long_ob if candidate == "long" else short_ob if candidate == "short" else None
 
     # ---------------- HARLEEN -----------------
-    news = get_news_warning()
     session = session_name()
     regime = market_regime(c15)
     levels = {}
@@ -1472,6 +1528,103 @@ def analyze_market():
 
     harleen_veto = bool(news)
 
+    # ---------------- v22 ADVANCED ENRICHMENT ----------------
+    # ATR is calculated once here and reused by v22 confirmations and risk.
+    a = atr(c5, 14)
+
+    # Keep all v22 calculations inside analyze_market() so the values are
+    # available to scoring, veto logic, output and journaling.
+    market = {
+        "candles": {
+            "15min": c15,
+            "5min": c5,
+            "1h": c1h,
+            "4h": c4h,
+        },
+        "support_resistance": {
+            "4h": sr4,
+            "1h": sr1,
+            "15m": sr15,
+        },
+        "psychological_levels": psy,
+        "atr": a,
+        "structure": s5,
+        "rsi_values": None,
+        "momentum_values": None,
+    }
+
+    base15 = c15
+    base5 = c5
+    level_source = base15 or base5 or c1h
+
+    market["v22_levels"] = {
+        "previous_periods": previous_period_levels(level_source),
+        "sessions": session_levels(level_source),
+    }
+
+    # Add dedicated 5M S/R to the v22 map.
+    market["support_resistance"]["5m"] = support_resistance(base5, 120)
+
+    # Nearest zone state for every timeframe.
+    sr_states = {}
+    for tf, srdata in market["support_resistance"].items():
+        sr_states[tf] = {}
+        if not isinstance(srdata, dict):
+            continue
+        for side, key in (("support", "supports"), ("resistance", "resistances")):
+            zones = srdata.get(key) or []
+            if zones:
+                z = min(zones, key=lambda zone: zone_distance(price, zone)
+                        if zone_distance(price, zone) is not None else float("inf"))
+                sr_states[tf][side] = {**z, "state": sr_state(price, z)}
+    market["sr_states"] = sr_states
+
+    # Break/retest confirmation uses the nearest 15M level and 5M candles.
+    market["break_retest"] = {}
+    br_atr = atr(base5, 14)
+    for side, direction in (("resistance", "LONG"), ("support", "SHORT")):
+        z = sr_states.get("15m", {}).get(side)
+        if z:
+            market["break_retest"][side] = break_retest_confirmation(
+                base5, z.get("level"), direction, br_atr
+            )
+
+    # Fibonacci extensions from the latest objective 5M swing pair.
+    sh = s5.get("swing_high")
+    sl = s5.get("swing_low")
+    market["fib_extensions"] = {}
+    if sh is not None and sl is not None:
+        market["fib_extensions"] = {
+            "LONG": fib_extension_targets(price, sh, sl, "LONG"),
+            "SHORT": fib_extension_targets(price, sh, sl, "SHORT"),
+        }
+
+    # RSI series was not previously retained by the engine. Calculate it
+    # locally when the rsi() helper exists; otherwise leave divergence neutral.
+    if "rsi" in globals():
+        try:
+            market["rsi_values"] = rsi_series([c["c"] for c in base15], 14)
+        except Exception:
+            market["rsi_values"] = None
+
+    if market.get("rsi_values"):
+        market["divergence"] = divergence_detection(base15, market["rsi_values"])
+    else:
+        market["divergence"] = {
+            "bullish": False, "bearish": False,
+            "details": "indicator series unavailable"
+        }
+
+    market["level_confluence"] = {
+        "sr_available": bool(market["support_resistance"]),
+        "psychological_available": bool(psy),
+        "previous_periods_available": bool(market["v22_levels"]["previous_periods"]),
+        "sessions_available": bool(market["v22_levels"]["sessions"]),
+        "break_retest": market["break_retest"],
+        "divergence": market["divergence"],
+        "fib_extensions": bool(market["fib_extensions"]),
+    }
+
     # ---------------- OBJECTIVE SCORE ----------------
     score, confluences = quality_score(
         candidate, price, c15, c5, bias4, bias1, s15, s5,
@@ -1479,7 +1632,8 @@ def analyze_market():
         flow=flow, momentum=momentum, pd=pd,
         sr=sr15, psy=psy,
         sr_near=nearest_sr(price, sr15),
-        sr_aligned=sr_confluence(candidate, price, sr15)[1] if candidate else False
+        sr_aligned=sr_confluence(candidate, price, sr15)[1] if candidate else False,
+        market=market
     )
     grade = score_grade(score)
 
@@ -1565,6 +1719,12 @@ def analyze_market():
                 "nearest": nearest_sr(price, sr15),
             },
             "psychological_levels": psy,
+            "v22_levels": market.get("v22_levels", {}),
+            "sr_states": market.get("sr_states", {}),
+            "break_retest": market.get("break_retest", {}),
+            "fib_extensions": market.get("fib_extensions", {}),
+            "divergence": market.get("divergence", {}),
+            "level_confluence": market.get("level_confluence", {}),
         },
 
         "risk": {
@@ -1581,6 +1741,8 @@ def analyze_market():
     # Record every scan that reaches the objective engine. This makes
     # later research possible even for rejected setups.
     journal_signal(result, event="SCAN")
+    ANALYSIS_CACHE["t"] = datetime.now().timestamp()
+    ANALYSIS_CACHE["d"] = result
     return result
 
 # ============================================================
@@ -1618,9 +1780,14 @@ If Python says no valid setup, say no valid setup.
 This is educational/manual analysis only, not guaranteed financial advice.
 Call the user Shay.
 
+Response style:
+- Be concise and decision-focused.
+- Keep normal signal replies under 350 words.
+- Do not repeat raw data that is already obvious from the objective result.
+
 Preferred format:
 
-SWARM v21.0
+SWARM v22.0
 Bias 4H/1H: ...
 Rosita: ...
 Harleen Verdict: PASS/VETO — reason
@@ -1664,11 +1831,12 @@ async def ask_groq(user_text, chat_id):
         msgs.append(m)
 
     try:
-        r = client.chat.completions.create(
+        r = await asyncio.to_thread(
+            client.chat.completions.create,
             model="openai/gpt-oss-20b",
             messages=msgs,
-            temperature=0.2,
-            max_tokens=1200,
+            temperature=0.1,
+            max_tokens=550,
         )
 
         txt = r.choices[0].message.content.strip()
@@ -2195,75 +2363,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-    # ---------- v22 advanced objective enrichment ----------
-    try:
-        base15 = market.get("candles", {}).get("15min") or market.get("candles", {}).get("15m") or []
-        base5 = market.get("candles", {}).get("5min") or market.get("candles", {}).get("5m") or []
-        base1h = market.get("candles", {}).get("1h") or []
-        base4h = market.get("candles", {}).get("4h") or []
-
-        level_source = base15 or base5 or base1h
-        market["v22_levels"] = {
-            "previous_periods": previous_period_levels(level_source),
-            "sessions": session_levels(level_source),
-        }
-
-        # 5M S/R was previously omitted from the dedicated map.
-        if base5 and "support_resistance" in globals():
-            market.setdefault("support_resistance", {})["5M"] = support_resistance(base5)
-
-        # S/R states for nearest zones.
-        sr_map = market.get("support_resistance", {})
-        nearest = {}
-        for tf, srdata in sr_map.items():
-            if isinstance(srdata, dict):
-                nearest[tf] = {}
-                for side in ("support", "resistance"):
-                    zones = srdata.get(side) or []
-                    if zones:
-                        z = zones[0]
-                        nearest[tf][side] = {
-                            **z,
-                            "state": sr_state(current_price, z)
-                        }
-        market["sr_states"] = nearest
-
-        # Break/retest checks around nearest S/R.
-        market["break_retest"] = {}
-        for side, direction in (("resistance", "LONG"), ("support", "SHORT")):
-            z = (nearest.get("15M", {}) or {}).get(side)
-            if z:
-                market["break_retest"][side] = break_retest_confirmation(
-                    base5 or base15, z.get("level"), direction, market.get("atr")
-                )
-
-        # Fibonacci extensions based on latest objective swing pair.
-        swings = market.get("structure", {}) or {}
-        sh = swings.get("swing_high")
-        sl = swings.get("swing_low")
-        if sh is not None and sl is not None:
-            market["fib_extensions"] = {
-                "LONG": fib_extension_targets(current_price, sh, sl, "LONG"),
-                "SHORT": fib_extension_targets(current_price, sh, sl, "SHORT"),
-            }
-
-        # Momentum divergence when an RSI-like series exists.
-        ind = market.get("rsi_values") or market.get("momentum_values")
-        if ind:
-            market["divergence"] = divergence_detection(base15, ind)
-        else:
-            market["divergence"] = {"bullish": False, "bearish": False, "details": "indicator series unavailable"}
-
-        # Compact level-overlap map: S/R against FVG/OB/OTE/liquidity references.
-        market["level_confluence"] = {
-            "sr_available": bool(sr_map),
-            "psychological_available": bool(market.get("psychological_levels")),
-            "previous_periods_available": bool(market["v22_levels"]["previous_periods"]),
-            "sessions_available": bool(market["v22_levels"]["sessions"]),
-            "break_retest": market.get("break_retest", {}),
-        }
-    except Exception as e:
-        market["v22_levels_error"] = str(e)
-

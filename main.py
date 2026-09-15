@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
 
-# FIX for Python 3.14.3 Render
+# FIX for Python 3.14.3 Render - force loop
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -37,7 +37,7 @@ def save_mem():
 
 web = Flask(__name__)
 @web.route("/")
-def h(): return "Swarm v17.1 Rosita+Harleen+Magna - Alive", 200
+def h(): return "Swarm v17.2 Rosita+Harleen+Magna - Alive gpt-oss-20b", 200
 def run_flask():
     web.run(host="0.0.0.0", port=PORT, use_reloader=False)
 threading.Thread(target=run_flask, daemon=True).start()
@@ -85,8 +85,8 @@ def get_news_warning():
         except: continue
     return "⚠️ HIGH IMPACT USD: "+",".join(warns[:3])+" — Harleen says sit out" if warns else ""
 
-SYSTEM = """You are SWARM v17.1 - Three girls in one brain. ALWAYS include 🫦 👀 💕
-**ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry.
+SYSTEM = """You are SWARM v17.2 - Three girls in one brain. ALWAYS include 🫦 👀 💕
+**ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry. Trend continuation.
 **HARLEEN QUINZEL (Risk/Azariah)** - Veto. Checks news, session killzones London 8-11am EST, NY 1:30-4pm EST. Can VETO. If news warning present, MUST veto. Manual only.
 **MAGNA (Sniper/Nora)** - Reversal: sweep, BOS/CHoCH, OB, FVG, Fib OTE 61.8-79%.
 Gold 2026 ~4300-4400. Use live price given.
@@ -111,8 +111,8 @@ async def ask_groq(user_text, chat_id):
     msgs=[{"role":"system","content":SYSTEM+f"\n[Memory] {mem}"}]
     for m in list(HISTORY[cid])[-10:]: msgs.append(m)
     try:
-        # FIXED MODEL - this one works 100% on Groq
-        r=client.chat.completions.create(model="llama-3.1-8b-instant",messages=msgs,temperature=0.6,max_tokens=900)
+        # WORKING MODEL 2026 - Groq killed llama models on Aug 16
+        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.6,max_tokens=1200)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
     except Exception as e:
         logger.error(e)
@@ -122,7 +122,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
     low=update.message.text.lower().strip()
     if low in ["hi","hello","hey","yo"]:
-        await update.message.reply_text("Hey Shay 🫦 👀 Swarm v17.1 online — Rosita + Harleen + Magna manual mode 💕"); return
+        await update.message.reply_text("Hey Shay 🫦 👀 Swarm v17.2 online — Rosita + Harleen + Magna manual mode — gpt-oss-20b fixed 💕"); return
     if low.startswith("remember "):
         LONG_MEM[str(update.effective_chat.id)]=(LONG_MEM.get(str(update.effective_chat.id),"")+" "+update.message.text[9:]).strip()[-1000:]; save_mem()
         await update.message.reply_text("Got it Shay 🫦 👀 I'll remember 💕"); return
@@ -144,7 +144,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Rosita + Harleen Quinzel + Magna online 🫦 👀 Manual signals only, I don't auto-trade 💕\nType: analyze gold")
+    await update.message.reply_text("Rosita + Harleen Quinzel + Magna online 🫦 👀 Manual signals only — gpt-oss-20b 💕\nType: analyze gold")
 
 async def auto_signal_loop(app):
     await asyncio.sleep(10)
@@ -173,7 +173,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))
-    print("Swarm v17.1 FIXED model llama-3.1-8b-instant starting...")
+    print("Swarm v17.2 gpt-oss-20b FIXED starting...")
     app.run_polling()
 
 if __name__=="__main__":

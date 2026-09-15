@@ -1,5 +1,4 @@
-flask
-python-telegram-bot==20.8
-groq
-yfinance
-pandas
+python-telegram-bot==20.7
+groq==0.4.2
+requests==2.31.0
+Flask==2.3.3

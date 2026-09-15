@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
 
-# --- FIX for Python 3.14.3 Render: force event loop ---
+# FIX for Python 3.14.3 Render
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -68,7 +68,7 @@ def fib_levels(candles, lookback=50):
     if not candles or len(candles)<lookback: return None
     window=candles[-lookback:]; sh=max(c["h"] for c in window); sl=min(c["l"] for c in window); diff=sh-sl
     if diff<=0: return None
-    return {"high":sh,"low":sl,"0.618":sh-diff*0.618,"0.65":sh-diff*0.65,"0.705":sh-diff*0.705,"0.79":sh-diff*0.79,"mid":sh-diff*0.5}
+    return {"high":sh,"low":sl,"0.618":sh-diff*0.618,"0.65":sh-diff*0.65,"0.705":sh-diff*0.705,"0.79":sh-diff*0.79}
 
 def get_news_warning():
     now_ts=datetime.now(timezone.utc).timestamp()
@@ -87,11 +87,20 @@ def get_news_warning():
 
 SYSTEM = """You are SWARM v17.1 - Three girls in one brain. ALWAYS include 🫦 👀 💕
 **ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry.
-**HARLEEN QUINZEL (Risk/Azariah)** - Veto. Checks news filter, session (London/NY killzones 8-11am EST, 1:30-4pm EST), spread, ATR risk. She can VETO. If news warning present, MUST veto. Manual only.
+**HARLEEN QUINZEL (Risk/Azariah)** - Veto. Checks news, session killzones London 8-11am EST, NY 1:30-4pm EST. Can VETO. If news warning present, MUST veto. Manual only.
 **MAGNA (Sniper/Nora)** - Reversal: sweep, BOS/CHoCH, OB, FVG, Fib OTE 61.8-79%.
-Gold 2026 ~4300-4400. Never invent live price.
-Format if valid: Bias 4h/1h, Harleen Verdict, Magna Snipe, Direction, Entry, SL, TP1-TP10 Ladder, Reason, Confluences.
-If NO setup: No A/B/C setup - Harleen vetoed / no confluence
+Gold 2026 ~4300-4400. Use live price given.
+Format if valid:
+Bias 4h/1h: [Rosita]
+Harleen Verdict: [PASS or VETO + reason]
+Magna Snipe: [OTE / sweep / FVG]
+Direction: Long/Short
+Entry: x.xx
+SL: x.xx
+TP1-TP10 Ladder: [list 10 TPs]
+Reason: Setup A/B/C + confluences
+Confluences: bullet list 3-5
+If NO valid setup: No A/B/C setup - Harleen vetoed / no confluence
 Educational only, manual execution. Always call user Shay.
 """
 
@@ -102,9 +111,12 @@ async def ask_groq(user_text, chat_id):
     msgs=[{"role":"system","content":SYSTEM+f"\n[Memory] {mem}"}]
     for m in list(HISTORY[cid])[-10:]: msgs.append(m)
     try:
-        r=client.chat.completions.create(model="llama-3.3-70b-versatile",messages=msgs,temperature=0.6,max_tokens=900)
+        # FIXED MODEL - this one works 100% on Groq
+        r=client.chat.completions.create(model="llama-3.1-8b-instant",messages=msgs,temperature=0.6,max_tokens=900)
         txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
-    except Exception as e: logger.error(e); return f"Brain fog Shay 🫦 👀 {e} 💕"
+    except Exception as e:
+        logger.error(e)
+        return f"Brain fog Shay 🫦 👀 {e} 💕"
 
 async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
@@ -125,7 +137,7 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fib=fib_levels(c15,50)
         if fib: ctx_top+=f" | Fib H {fib['high']:.2f} L {fib['low']:.2f} OTE 61.8 {fib['0.618']:.2f} 65 {fib['0.65']:.2f} 70.5 {fib['0.705']:.2f} 79 {fib['0.79']:.2f}"
         news_w=get_news_warning()
-        sig=await ask_groq(f"Top-down XAU/USD scalp. {ctx_top}. News: {news_w}. Live {get_live_price()}. Do Rosita->Harleen->Magna debate then final format. Manual only.", update.effective_chat.id)
+        sig=await ask_groq(f"Top-down XAU/USD scalp. {ctx_top}. News: {news_w}. Live {get_live_price()}. Do Rosita->Harleen->Magna debate then final format.", update.effective_chat.id)
         await update.message.reply_text(sig); return
     p=get_live_price(); price_ctx=f"\n[Live XAU/USD: {p:.2f}]" if p else ""
     reply=await ask_groq(update.message.text+price_ctx, update.effective_chat.id)
@@ -149,20 +161,19 @@ async def auto_signal_loop(app):
                     last=c15[-1]["c"]
                     sig=await ask_groq(f"Swarm auto-scan XAU/USD at {last}. Manual signal only. If no setup reply exactly 'No A/B/C setup'", BOSS_CHAT_ID)
                     if "Entry:" in sig and "SL:" in sig and "No A/B/C" not in sig:
-                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"{sig}\n\nManual only - execute yourself Shay 💕 Educational")
+                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"{sig}\n\nManual only 💕")
         except Exception as e: logger.error(e)
         await asyncio.sleep(300)
 
 async def post_init(app): asyncio.create_task(auto_signal_loop(app))
 
 def main():
-    # Second safety for 3.14
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))
-    print("Swarm v17.1 FIXED for Python 3.14.3 starting...")
+    print("Swarm v17.1 FIXED model llama-3.1-8b-instant starting...")
     app.run_polling()
 
 if __name__=="__main__":

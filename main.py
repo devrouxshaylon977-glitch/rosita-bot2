@@ -1,180 +1,2269 @@
-import os, asyncio, logging, requests, threading, json
+
+def v22_score_bonus(direction, market):
+    """Additional conservative confluence points, capped at 12."""
+    bonus = 0
+    direction = direction.upper()
+    div = market.get("divergence", {}) or {}
+    if direction == "LONG" and div.get("bullish"):
+        bonus += 2
+    if direction == "SHORT" and div.get("bearish"):
+        bonus += 2
+
+    br = market.get("break_retest", {}) or {}
+    br_side = br.get("resistance" if direction == "LONG" else "support", {}) or {}
+    if br_side.get("confirmed"):
+        bonus += 3
+
+    pp = market.get("v22_levels", {}).get("previous_periods", {}) or {}
+    if pp:
+        bonus += 1
+
+    sessions = market.get("v22_levels", {}).get("sessions", {}) or {}
+    if sessions:
+        bonus += 1
+
+    fibext = (market.get("fib_extensions", {}) or {}).get(direction, {})
+    if fibext:
+        bonus += 1
+
+    # Reward objective 5M S/R presence without assuming direction.
+    if market.get("support_resistance", {}).get("5M"):
+        bonus += 1
+
+    return min(bonus, 12)
+
+
+
+# =========================
+# v22: ADVANCED LEVELS / CONFIRMATIONS
+# =========================
+
+SESSION_WINDOWS_UTC = {
+    "ASIAN": (0, 8),
+    "LONDON": (7, 16),
+    "NEW_YORK": (13, 21),
+}
+
+def _candle_ts(c):
+    return c.get("datetime") or c.get("time") or c.get("timestamp")
+
+def _hour_utc(c):
+    try:
+        ts = str(_candle_ts(c))
+        # ISO timestamps: YYYY-MM-DDTHH:MM:SS...
+        m = re.search(r"T(\d{2}):", ts)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def previous_period_levels(candles):
+    """Objective previous-day and previous-week OHLC levels from candle timestamps."""
+    if not candles:
+        return {}
+    rows = []
+    for c in candles:
+        try:
+            ts = str(_candle_ts(c)).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            rows.append((dt, float(c["high"]), float(c["low"]), float(c["close"])))
+        except Exception:
+            continue
+    if not rows:
+        return {}
+
+    latest_date = rows[-1][0].date()
+    prev_day = [x for x in rows if x[0].date() < latest_date and x[0].date() == max(
+        y[0].date() for y in rows if y[0].date() < latest_date
+    )] if any(x[0].date() < latest_date for x in rows) else []
+
+    latest_week = rows[-1][0].isocalendar()[:2]
+    older_weeks = [x[0].isocalendar()[:2] for x in rows if x[0].isocalendar()[:2] < latest_week]
+    prev_week_key = max(older_weeks) if older_weeks else None
+    prev_week = [x for x in rows if prev_week_key and x[0].isocalendar()[:2] == prev_week_key]
+
+    def pack(items):
+        if not items:
+            return {}
+        return {
+            "high": max(x[1] for x in items),
+            "low": min(x[2] for x in items),
+            "open": items[0][3],
+            "close": items[-1][3],
+        }
+
+    return {"previous_day": pack(prev_day), "previous_week": pack(prev_week)}
+
+def session_levels(candles):
+    """Approximate UTC session high/low levels using candle timestamps."""
+    out = {}
+    for name, (start_h, end_h) in SESSION_WINDOWS_UTC.items():
+        subset = []
+        for c in candles or []:
+            h = _hour_utc(c)
+            if h is None:
+                continue
+            # Handles windows that cross midnight.
+            inside = start_h <= h < end_h if start_h < end_h else (h >= start_h or h < end_h)
+            if inside:
+                try:
+                    subset.append((float(c["high"]), float(c["low"])))
+                except Exception:
+                    pass
+        if subset:
+            out[name] = {
+                "high": max(x[0] for x in subset),
+                "low": min(x[1] for x in subset),
+                "range": max(x[0] for x in subset) - min(x[1] for x in subset),
+            }
+    return out
+
+def fibonacci_extensions(swing_high, swing_low, direction="LONG"):
+    """Objective 1.272/1.618/2.0 extension references."""
+    try:
+        hi, lo = float(swing_high), float(swing_low)
+        rng = abs(hi - lo)
+        if rng <= 0:
+            return {}
+        if direction.upper() == "LONG":
+            base = hi
+            return {
+                "1.272": base + rng * 0.272,
+                "1.618": base + rng * 0.618,
+                "2.000": base + rng * 1.000,
+            }
+        base = lo
+        return {
+            "1.272": base - rng * 0.272,
+            "1.618": base - rng * 0.618,
+            "2.000": base - rng * 1.000,
+        }
+    except Exception:
+        return {}
+
+def _pivot_series(candles, field="close", lookback=120):
+    vals = []
+    for c in (candles or [])[-lookback:]:
+        try:
+            vals.append(float(c[field]))
+        except Exception:
+            vals.append(None)
+    return vals
+
+def _local_pivots(values, left=2, right=2):
+    highs, lows = [], []
+    for i in range(left, len(values) - right):
+        if values[i] is None:
+            continue
+        window = [v for v in values[i-left:i+right+1] if v is not None]
+        if not window:
+            continue
+        if values[i] == max(window):
+            highs.append((i, values[i]))
+        if values[i] == min(window):
+            lows.append((i, values[i]))
+    return highs, lows
+
+def divergence_detection(candles, indicator_values, lookback=100):
+    """Classic-price vs momentum divergence proxy. Returns confirmed pivot-pair signals."""
+    if not candles or not indicator_values:
+        return {"bullish": False, "bearish": False, "details": "unknown"}
+
+    n = min(len(candles), len(indicator_values), lookback)
+    prices = []
+    inds = []
+    for c, ind in zip(candles[-n:], indicator_values[-n:]):
+        try:
+            prices.append(float(c["close"]))
+            inds.append(float(ind))
+        except Exception:
+            prices.append(None)
+            inds.append(None)
+
+    ph, pl = _local_pivots(prices)
+    ih, il = _local_pivots(inds)
+
+    bullish = bearish = False
+    details = []
+    if len(pl) >= 2 and len(il) >= 2:
+        p1, p2 = pl[-2][1], pl[-1][1]
+        i1, i2 = il[-2][1], il[-1][1]
+        if p2 < p1 and i2 > i1:
+            bullish = True
+            details.append("bullish divergence")
+    if len(ph) >= 2 and len(ih) >= 2:
+        p1, p2 = ph[-2][1], ph[-1][1]
+        i1, i2 = ih[-2][1], ih[-1][1]
+        if p2 > p1 and i2 < i1:
+            bearish = True
+            details.append("bearish divergence")
+
+    return {"bullish": bullish, "bearish": bearish, "details": ", ".join(details) or "none"}
+
+def sr_state(price, zone, tolerance=0.0015):
+    """Classifies a zone as fresh/active/tested/broken using current price."""
+    try:
+        p = float(price)
+        lo = float(zone["low"])
+        hi = float(zone["high"])
+        mid = (lo + hi) / 2
+        width = max(hi - lo, abs(mid) * tolerance)
+        if lo <= p <= hi:
+            return "ACTIVE"
+        if p > hi + width:
+            return "BROKEN_ABOVE"
+        if p < lo - width:
+            return "BROKEN_BELOW"
+        return "TESTING"
+    except Exception:
+        return "UNKNOWN"
+
+def break_retest_confirmation(candles, level, direction, atr_value=None):
+    """Detects a simple objective break + retest sequence."""
+    if not candles or level is None:
+        return {"confirmed": False, "reason": "missing data"}
+    try:
+        lev = float(level)
+        tol = float(atr_value) * 0.20 if atr_value else max(lev * 0.0005, 0.25)
+        recent = candles[-12:]
+        closes = [float(c["close"]) for c in recent]
+        highs = [float(c["high"]) for c in recent]
+        lows = [float(c["low"]) for c in recent]
+        if direction.upper() == "LONG":
+            broke = any(x > lev + tol for x in closes[:-2])
+            retest = any(abs(x - lev) <= tol or lo <= lev + tol for x, lo in zip(closes[-3:], lows[-3:]))
+            held = closes[-1] > lev
+        else:
+            broke = any(x < lev - tol for x in closes[:-2])
+            retest = any(abs(x - lev) <= tol or hi >= lev - tol for x, hi in zip(closes[-3:], highs[-3:]))
+            held = closes[-1] < lev
+        return {"confirmed": bool(broke and retest and held), "broke": broke, "retest": retest, "held": held}
+    except Exception as e:
+        return {"confirmed": False, "reason": str(e)}
+
+def fib_extension_targets(entry, swing_high, swing_low, direction):
+    """Extension targets measured from the most recent swing range."""
+    ext = fibonacci_extensions(swing_high, swing_low, direction)
+    return {k: round(v, 2) for k, v in ext.items()} if ext else {}
+
+
+from math import isfinite
+import os
+import asyncio
+import logging
+import requests
+import threading
+import json
+import math
+import uuid
 from datetime import datetime, timezone
 from collections import defaultdict, deque
+
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from groq import Groq
 
-# FIX for Python 3.14.3 Render - force loop
+# ============================================================
+# SWARM v21.0 — ROSITA + HARLEEN QUINZEL + MAGNA
+# Objective Python market engine + Groq explanation layer
+#
+# IMPORTANT:
+# - Manual/educational analysis only.
+# - Python calculates technical measurements and trade levels.
+# - Groq is NOT allowed to invent Entry/SL/TP.
+# - Backtesting is included, but historical performance is not
+#   a guarantee of future results.
+# ============================================================
+
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Swarm17")
+logger = logging.getLogger("Swarm19")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_KEY", "")
 BOSS_CHAT_ID = os.getenv("BOSS_CHAT_ID", "")
 PORT = int(os.getenv("PORT", "10000") or 10000)
+
 MEM_FILE = "rosita_memory.json"
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-CACHE = {}
-NEWS_CACHE = {"t":0,"d":[]}
-HISTORY = defaultdict(lambda: deque(maxlen=12))
 
-try:
-    with open(MEM_FILE, "r") as f: LONG_MEM = json.load(f)
-except: LONG_MEM = {}
-def save_mem():
+CACHE = {}
+NEWS_CACHE = {"t": 0, "d": []}
+HISTORY = defaultdict(lambda: deque(maxlen=12))
+LOCK = threading.Lock()
+
+# ============================================================
+# V19 RESEARCH JOURNAL / SIGNAL REGISTRY
+# ============================================================
+
+JOURNAL_FILE = os.getenv("JOURNAL_FILE", "swarm_signal_journal.jsonl")
+
+def make_signal_id():
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+def journal_signal(result, outcome=None, r_result=None, event="SIGNAL"):
+    """Append an immutable-ish JSONL research record."""
     try:
-        with open(MEM_FILE, "w") as f: json.dump(LONG_MEM, f)
-    except: pass
+        record = {
+            "event": event,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "signal_id": result.get("signal_id"),
+            "symbol": result.get("symbol"),
+            "price": result.get("price"),
+            "direction": result.get("magna", {}).get("direction"),
+            "valid": result.get("valid"),
+            "score": result.get("score"),
+            "grade": result.get("grade"),
+            "regime": result.get("regime"),
+            "rosita": result.get("rosita", {}),
+            "harleen": result.get("harleen", {}),
+            "magna": result.get("magna", {}),
+            "risk": result.get("risk", {}),
+            "confluences": result.get("confluences", []),
+            "outcome": outcome,
+            "r_result": r_result,
+        }
+        with LOCK:
+            with open(JOURNAL_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        logger.error("Journal error: %s", e)
+
+def load_journal(limit=5000):
+    rows = []
+    try:
+        with LOCK:
+            with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.error("Journal read error: %s", e)
+        return []
+    return rows[-limit:]
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
 
 web = Flask(__name__)
+
 @web.route("/")
-def h(): return "Swarm v17.2 Rosita+Harleen+Magna - Alive gpt-oss-20b", 200
+def health():
+    return "Swarm v21.0 Rosita + Harleen Quinzel + Magna — objective engine alive", 200
+
 def run_flask():
     web.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
 threading.Thread(target=run_flask, daemon=True).start()
 
-def get_candles(symbol="XAU/USD", interval="4h", n=200):
-    key=f"{symbol}_{interval}"; now=datetime.now().timestamp()
-    if key in CACHE and now-CACHE[key]["t"]<300: return CACHE[key]["d"]
-    try:
-        r=requests.get("https://api.twelvedata.com/time_series",
-            params={"symbol":symbol,"interval":interval,"outputsize":n,"apikey":TWELVEDATA_KEY},timeout=20).json()
-        vals=r.get("values",[])
-        if not vals: return None
-        candles=[{"t":v["datetime"],"o":float(v["open"]),"h":float(v["high"]),"l":float(v["low"]),"c":float(v["close"])} for v in reversed(vals)]
-        CACHE[key]={"t":now,"d":candles}
-        return candles
-    except: return None
+# ============================================================
+# MEMORY
+# ============================================================
 
-def get_live_price(): c=get_candles("XAU/USD","5min",5); return c[-1]["c"] if c else None
+try:
+    with open(MEM_FILE, "r", encoding="utf-8") as f:
+        LONG_MEM = json.load(f)
+except Exception:
+    LONG_MEM = {}
+
+def save_mem():
+    try:
+        with open(MEM_FILE, "w", encoding="utf-8") as f:
+            json.dump(LONG_MEM, f)
+    except Exception:
+        pass
+
+# ============================================================
+# DATA
+# ============================================================
+
+def get_candles(symbol="XAU/USD", interval="4h", n=200):
+    key = f"{symbol}_{interval}_{n}"
+    now = datetime.now().timestamp()
+
+    if key in CACHE and now - CACHE[key]["t"] < 120:
+        return CACHE[key]["d"]
+
+    if not TWELVEDATA_KEY:
+        return None
+
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": n,
+                "apikey": TWELVEDATA_KEY,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        vals = data.get("values", [])
+        if not vals:
+            logger.warning("Twelve Data returned no values: %s", data)
+            return None
+
+        candles = []
+        for v in reversed(vals):
+            candles.append({
+                "t": v["datetime"],
+                "o": float(v["open"]),
+                "h": float(v["high"]),
+                "l": float(v["low"]),
+                "c": float(v["close"]),
+            })
+
+        CACHE[key] = {"t": now, "d": candles}
+        return candles
+
+    except Exception as e:
+        logger.error("Candle error %s %s: %s", symbol, interval, e)
+        return None
+
+def get_live_price():
+    candles = get_candles("XAU/USD", "5min", 5)
+    return candles[-1]["c"] if candles else None
+
+# ============================================================
+# BASIC INDICATORS
+# ============================================================
+
 def ema(values, period):
-    k=2/(period+1); e=values[0]; out=[]
-    for v in values: e=v*k+e*(1-k); out.append(e)
+    if not values:
+        return []
+
+    k = 2 / (period + 1)
+    e = values[0]
+    out = []
+
+    for v in values:
+        e = v * k + e * (1 - k)
+        out.append(e)
+
     return out
+
+def true_ranges(candles):
+    if not candles:
+        return []
+
+    tr = []
+    prev_close = candles[0]["c"]
+
+    for c in candles:
+        tr.append(max(
+            c["h"] - c["l"],
+            abs(c["h"] - prev_close),
+            abs(c["l"] - prev_close),
+        ))
+        prev_close = c["c"]
+
+    return tr
+
+def atr(candles, period=14):
+    if not candles or len(candles) < period:
+        return None
+
+    trs = true_ranges(candles)
+    return sum(trs[-period:]) / period
+
 def tf_bias(candles):
-    if not candles or len(candles)<22: return "unknown"
-    closes=[c["c"] for c in candles]; e9=ema(closes,9); e21=ema(closes,21)
-    return "bullish" if e9[-1]>e21[-1] else "bearish"
-def fib_levels(candles, lookback=50):
-    if not candles or len(candles)<lookback: return None
-    window=candles[-lookback:]; sh=max(c["h"] for c in window); sl=min(c["l"] for c in window); diff=sh-sl
-    if diff<=0: return None
-    return {"high":sh,"low":sl,"0.618":sh-diff*0.618,"0.65":sh-diff*0.65,"0.705":sh-diff*0.705,"0.79":sh-diff*0.79}
+    if not candles or len(candles) < 22:
+        return "unknown"
+
+    closes = [c["c"] for c in candles]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+
+    if e9[-1] > e21[-1]:
+        return "bullish"
+    if e9[-1] < e21[-1]:
+        return "bearish"
+    return "neutral"
+
+# ============================================================
+# SWING / MARKET STRUCTURE
+# ============================================================
+
+def swing_points(candles, left=2, right=2):
+    highs = []
+    lows = []
+
+    if len(candles) < left + right + 1:
+        return highs, lows
+
+    for i in range(left, len(candles) - right):
+        h = candles[i]["h"]
+        l = candles[i]["l"]
+
+        left_highs = [candles[j]["h"] for j in range(i-left, i)]
+        right_highs = [candles[j]["h"] for j in range(i+1, i+right+1)]
+        left_lows = [candles[j]["l"] for j in range(i-left, i)]
+        right_lows = [candles[j]["l"] for j in range(i+1, i+right+1)]
+
+        if h > max(left_highs) and h >= max(right_highs):
+            highs.append((i, h))
+
+        if l < min(left_lows) and l <= min(right_lows):
+            lows.append((i, l))
+
+    return highs, lows
+
+def structure_state(candles):
+    if not candles or len(candles) < 12:
+        return {
+            "state": "unknown",
+            "bos": None,
+            "choch": None,
+            "swing_high": None,
+            "swing_low": None,
+        }
+
+    highs, lows = swing_points(candles)
+
+    if len(highs) < 2 or len(lows) < 2:
+        return {
+            "state": "range",
+            "bos": None,
+            "choch": None,
+            "swing_high": highs[-1][1] if highs else None,
+            "swing_low": lows[-1][1] if lows else None,
+        }
+
+    prev_h = highs[-2][1]
+    last_h = highs[-1][1]
+    prev_l = lows[-2][1]
+    last_l = lows[-1][1]
+
+    if last_h > prev_h and last_l > prev_l:
+        state = "bullish"
+    elif last_h < prev_h and last_l < prev_l:
+        state = "bearish"
+    else:
+        state = "range"
+
+    close = candles[-1]["c"]
+
+    recent_high = highs[-1][1]
+    recent_low = lows[-1][1]
+
+    bos = None
+    choch = None
+
+    # Breaks are deliberately confirmed using candle CLOSE.
+    if close > recent_high:
+        bos = "bullish"
+    elif close < recent_low:
+        bos = "bearish"
+
+    # CHoCH approximation: price breaks the opposite-side swing
+    # after the previous structure was directional.
+    if state == "bearish" and close > recent_high:
+        choch = "bullish"
+    elif state == "bullish" and close < recent_low:
+        choch = "bearish"
+
+    return {
+        "state": state,
+        "bos": bos,
+        "choch": choch,
+        "swing_high": recent_high,
+        "swing_low": recent_low,
+    }
+
+# ============================================================
+# LIQUIDITY SWEEPS
+# ============================================================
+
+def liquidity_sweep(candles, lookback=20, tolerance=0.0008):
+    """
+    Finds a recent wick through a prior high/low followed by a close
+    back inside the prior range.
+
+    This is an objective approximation, not a claim of institutional
+    order-flow visibility.
+    """
+    if not candles or len(candles) < lookback + 3:
+        return None
+
+    recent = candles[-1]
+    prior = candles[-lookback-1:-1]
+
+    prior_high = max(c["h"] for c in prior)
+    prior_low = min(c["l"] for c in prior)
+
+    high_tol = max(prior_high * tolerance, 0.01)
+    low_tol = max(prior_low * tolerance, 0.01)
+
+    # Bearish liquidity sweep:
+    # wick above previous high, close below it.
+    if recent["h"] > prior_high + high_tol and recent["c"] < prior_high:
+        return {
+            "type": "buy_side_sweep",
+            "level": prior_high,
+            "direction": "bearish",
+        }
+
+    # Bullish liquidity sweep:
+    # wick below previous low, close above it.
+    if recent["l"] < prior_low - low_tol and recent["c"] > prior_low:
+        return {
+            "type": "sell_side_sweep",
+            "level": prior_low,
+            "direction": "bullish",
+        }
+
+    return None
+
+# ============================================================
+# FVG
+# ============================================================
+
+def find_fvgs(candles, max_age=20):
+    """
+    Three-candle imbalance approximation.
+
+    Bullish FVG:
+        candle[i].high < candle[i+2].low
+
+    Bearish FVG:
+        candle[i].low > candle[i+2].high
+    """
+    out = []
+
+    if not candles or len(candles) < 3:
+        return out
+
+    start = max(0, len(candles) - max_age - 2)
+
+    for i in range(start, len(candles) - 2):
+        a = candles[i]
+        c = candles[i + 2]
+
+        if a["h"] < c["l"]:
+            out.append({
+                "type": "bullish",
+                "low": a["h"],
+                "high": c["l"],
+                "index": i + 1,
+            })
+
+        if a["l"] > c["h"]:
+            out.append({
+                "type": "bearish",
+                "low": c["h"],
+                "high": a["l"],
+                "index": i + 1,
+            })
+
+    return out
+
+def nearest_fvg(candles, direction, price):
+    fvgs = find_fvgs(candles)
+
+    candidates = [
+        f for f in fvgs
+        if f["type"] == direction
+    ]
+
+    if not candidates:
+        return None
+
+    # Prefer the nearest zone to current price.
+    def distance(f):
+        if f["low"] <= price <= f["high"]:
+            return 0
+        return min(abs(price - f["low"]), abs(price - f["high"]))
+
+    return min(candidates, key=distance)
+
+# ============================================================
+# ORDER BLOCK CANDIDATE
+# ============================================================
+
+def order_block_candidate(candles, direction, lookback=30):
+    """
+    Conservative price-action approximation:
+    - Bullish OB = most recent bearish candle before a strong bullish move.
+    - Bearish OB = most recent bullish candle before a strong bearish move.
+
+    "Order block" is treated as a price-action zone, not proof of
+    institutional orders.
+    """
+    if not candles or len(candles) < 8:
+        return None
+
+    start = max(1, len(candles) - lookback)
+
+    ranges = [
+        c["h"] - c["l"]
+        for c in candles[start:]
+        if c["h"] > c["l"]
+    ]
+
+    if not ranges:
+        return None
+
+    avg_range = sum(ranges) / len(ranges)
+
+    for i in range(len(candles) - 2, start - 1, -1):
+        c = candles[i]
+        nxt = candles[i + 1]
+
+        body = abs(c["c"] - c["o"])
+        next_body = abs(nxt["c"] - nxt["o"])
+
+        if direction == "bullish":
+            if c["c"] < c["o"] and nxt["c"] > nxt["o"]:
+                if next_body >= max(avg_range * 0.8, body * 1.2):
+                    return {
+                        "type": "bullish",
+                        "low": c["l"],
+                        "high": c["h"],
+                        "index": i,
+                    }
+
+        if direction == "bearish":
+            if c["c"] > c["o"] and nxt["c"] < nxt["o"]:
+                if next_body >= max(avg_range * 0.8, body * 1.2):
+                    return {
+                        "type": "bearish",
+                        "low": c["l"],
+                        "high": c["h"],
+                        "index": i,
+                    }
+
+    return None
+
+# ============================================================
+# FIB / OTE
+# ============================================================
+
+def fib_ote(candles, lookback=50):
+    if not candles or len(candles) < lookback:
+        return None
+
+    window = candles[-lookback:]
+    high = max(c["h"] for c in window)
+    low = min(c["l"] for c in window)
+
+    if high <= low:
+        return None
+
+    diff = high - low
+
+    return {
+        "high": high,
+        "low": low,
+        "range": diff,
+        "0.618": high - diff * 0.618,
+        "0.65": high - diff * 0.65,
+        "0.705": high - diff * 0.705,
+        "0.79": high - diff * 0.79,
+    }
+
+def in_ote(price, fib, direction):
+    if not fib:
+        return False
+
+    if direction == "long":
+        zone_low = fib["0.79"]
+        zone_high = fib["0.618"]
+    else:
+        # Mirror the zone for bearish retracement.
+        zone_low = fib["low"] + fib["range"] * 0.618
+        zone_high = fib["low"] + fib["range"] * 0.79
+
+    return min(zone_low, zone_high) <= price <= max(zone_low, zone_high)
+
+# ============================================================
+# SESSION
+# ============================================================
+
+def session_name():
+    """
+    Uses UTC internally. Change these if your preferred session
+    definition differs.
+
+    London: 08:00-11:00 UTC
+    New York: 13:30-16:00 UTC
+    """
+    hour_min = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+
+    if 8 * 60 <= hour_min <= 11 * 60:
+        return "London killzone"
+
+    if 13 * 60 + 30 <= hour_min <= 16 * 60:
+        return "New York killzone"
+
+    return "outside killzone"
+
+# ============================================================
+# NEWS
+# ============================================================
 
 def get_news_warning():
-    now_ts=datetime.now(timezone.utc).timestamp()
-    if now_ts-NEWS_CACHE["t"]<1800: events=NEWS_CACHE["d"]
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    if now_ts - NEWS_CACHE["t"] < 1800:
+        events = NEWS_CACHE["d"]
     else:
-        try: r=requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",timeout=15).json(); events=r; NEWS_CACHE["t"]=now_ts; NEWS_CACHE["d"]=events
-        except: return ""
-    warns=[]; now=datetime.now(timezone.utc)
+        try:
+            r = requests.get(
+                "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                timeout=15,
+            )
+            r.raise_for_status()
+            events = r.json()
+
+            NEWS_CACHE["t"] = now_ts
+            NEWS_CACHE["d"] = events
+
+        except Exception as e:
+            logger.error("News error: %s", e)
+            return ""
+
+    warns = []
+    now = datetime.now(timezone.utc)
+
     for ev in events:
         try:
-            if ev.get("country")!="USD" or ev.get("impact")!="High": continue
-            dt=datetime.fromisoformat(ev["date"].replace("Z","+00:00")); diff=(dt-now).total_seconds()/60
-            if -30<=diff<=60: warns.append(f"{ev['title']} ({int(diff)}m)")
-        except: continue
-    return "⚠️ HIGH IMPACT USD: "+",".join(warns[:3])+" — Harleen says sit out" if warns else ""
+            if ev.get("country") != "USD":
+                continue
 
-SYSTEM = """You are SWARM v17.2 - Three girls in one brain. ALWAYS include 🫦 👀 💕
-**ROSITA (Boss/Alice)** - Top-down: 4h bias -> 1h bias -> 15m structure -> 5m entry. Trend continuation.
-**HARLEEN QUINZEL (Risk/Azariah)** - Veto. Checks news, session killzones London 8-11am EST, NY 1:30-4pm EST. Can VETO. If news warning present, MUST veto. Manual only.
-**MAGNA (Sniper/Nora)** - Reversal: sweep, BOS/CHoCH, OB, FVG, Fib OTE 61.8-79%.
-Gold 2026 ~4300-4400. Use live price given.
-Format if valid:
-Bias 4h/1h: [Rosita]
-Harleen Verdict: [PASS or VETO + reason]
-Magna Snipe: [OTE / sweep / FVG]
-Direction: Long/Short
-Entry: x.xx
-SL: x.xx
-TP1-TP10 Ladder: [list 10 TPs]
-Reason: Setup A/B/C + confluences
-Confluences: bullet list 3-5
-If NO valid setup: No A/B/C setup - Harleen vetoed / no confluence
-Educational only, manual execution. Always call user Shay.
+            if ev.get("impact") != "High":
+                continue
+
+            dt = datetime.fromisoformat(
+                ev["date"].replace("Z", "+00:00")
+            )
+
+            diff = (dt - now).total_seconds() / 60
+
+            if -30 <= diff <= 60:
+                warns.append(
+                    f"{ev.get('title', 'USD event')} ({int(diff)}m)"
+                )
+
+        except Exception:
+            continue
+
+    if warns:
+        return (
+            "HIGH IMPACT USD: "
+            + ", ".join(warns[:3])
+            + " — HARLEEN VETO"
+        )
+
+    return ""
+
+# ============================================================
+# OBJECTIVE SWARM ENGINE
+# ============================================================
+
+
+def average_range(candles, period=20):
+    if not candles:
+        return None
+    sample = candles[-min(period, len(candles)):]
+    if not sample:
+        return None
+    return sum(max(x["h"] - x["l"], 0) for x in sample) / len(sample)
+
+def price_levels(candles, lookback=50):
+    """Objective liquidity reference levels from completed historical candles."""
+    if not candles:
+        return {}
+    sample = candles[-min(lookback, len(candles)):]
+    return {
+        "recent_high": max(x["h"] for x in sample),
+        "recent_low": min(x["l"] for x in sample),
+        "equal_high": detect_equal_level(sample, "high"),
+        "equal_low": detect_equal_level(sample, "low"),
+    }
+
+def detect_equal_level(candles, side, tolerance=0.0015, min_hits=2):
+    """Approximate equal highs/lows without claiming order-book knowledge."""
+    if len(candles) < 5:
+        return None
+    vals = [c["h"] if side == "high" else c["l"] for c in candles[-40:]]
+    clusters = []
+    for v in vals:
+        placed = False
+        for cluster in clusters:
+            center = sum(cluster) / len(cluster)
+            if center and abs(v - center) / center <= tolerance:
+                cluster.append(v)
+                placed = True
+                break
+        if not placed:
+            clusters.append([v])
+    good = [x for x in clusters if len(x) >= min_hits]
+    if not good:
+        return None
+    best = max(good, key=len)
+    return round(sum(best) / len(best), 2)
+
+def session_levels(candles):
+    """Previous-day/session-style levels when timestamps are parseable."""
+    if not candles:
+        return {}
+    # Twelve Data timestamps can vary; use the last UTC date as a stable,
+    # non-predictive reference and the immediately preceding date.
+    parsed = []
+    for c in candles:
+        try:
+            dt = datetime.fromisoformat(str(c["t"]).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parsed.append((dt.astimezone(timezone.utc).date(), c))
+        except Exception:
+            continue
+
+    if not parsed:
+        return {}
+
+    latest_day = parsed[-1][0]
+    previous = [c for d, c in parsed if d < latest_day]
+    current = [c for d, c in parsed if d == latest_day]
+
+    out = {}
+    if previous:
+        out["previous_day_high"] = round(max(c["h"] for c in previous), 2)
+        out["previous_day_low"] = round(min(c["l"] for c in previous), 2)
+    if current:
+        out["current_session_high"] = round(max(c["h"] for c in current), 2)
+        out["current_session_low"] = round(min(c["l"] for c in current), 2)
+    return out
+
+def market_regime(candles, atr_period=14, trend_period=50):
+    """Classify trend/range/volatility using deterministic price statistics."""
+    if not candles or len(candles) < max(atr_period + 5, trend_period + 5):
+        return {"name": "unknown", "trend_strength": 0, "volatility": "unknown"}
+
+    a = atr(candles, atr_period)
+    avg_r = average_range(candles, atr_period)
+    closes = [c["c"] for c in candles]
+    fast = ema(closes, 9)
+    slow = ema(closes, 21)
+    base = ema(closes, trend_period)
+
+    if None in (a, avg_r, fast, slow, base) or base == 0:
+        return {"name": "unknown", "trend_strength": 0, "volatility": "unknown"}
+
+    trend_gap = abs(fast - slow) / base
+    volatility_ratio = a / base
+
+    if trend_gap >= 0.0025:
+        trend = "trending"
+    elif trend_gap <= 0.0010:
+        trend = "ranging"
+    else:
+        trend = "transition"
+
+    # Relative thresholds are intentionally broad and instrument-aware.
+    if volatility_ratio >= 0.0040:
+        vol = "high"
+    elif volatility_ratio <= 0.0015:
+        vol = "low"
+    else:
+        vol = "normal"
+
+    return {
+        "name": f"{trend}_{vol}",
+        "trend_strength": round(trend_gap * 10000, 2),
+        "volatility": vol,
+        "atr": round(a, 2),
+        "avg_range": round(avg_r, 2),
+    }
+
+def zone_distance(price, zone):
+    if not zone or price is None:
+        return None
+    try:
+        hi = max(float(zone["high"]), float(zone["low"]))
+        lo = min(float(zone["high"]), float(zone["low"]))
+        if lo <= price <= hi:
+            return 0.0
+        return min(abs(price - lo), abs(price - hi))
+    except Exception:
+        return None
+
+
+
+def cluster_levels(values, tolerance):
+    """Cluster nearby prices into objective zones."""
+    if not values:
+        return []
+    vals = sorted(float(v) for v in values if v is not None)
+    clusters = []
+    for v in vals:
+        if not clusters:
+            clusters.append([v])
+            continue
+        center = sum(clusters[-1]) / len(clusters[-1])
+        if abs(v - center) <= tolerance:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return clusters
+
+def support_resistance(candles, lookback=120, atr_period=14):
+    """
+    Build S/R zones from repeated swing reactions.
+
+    This is a price-action S/R model, not a claim about hidden institutional
+    orders. A level gets stronger when multiple independent swing points
+    cluster around the same price.
+    """
+    if not candles or len(candles) < 20:
+        return {"supports": [], "resistances": []}
+
+    sample = candles[-min(lookback, len(candles)):]
+    a = atr(sample, atr_period) or average_range(sample, 20) or 1.0
+    tolerance = max(a * 0.30, sample[-1]["c"] * 0.0008)
+
+    lows = []
+    highs = []
+    for i in range(2, len(sample) - 2):
+        if sample[i]["l"] <= min(sample[i-2]["l"], sample[i-1]["l"],
+                                  sample[i+1]["l"], sample[i+2]["l"]):
+            lows.append(sample[i]["l"])
+        if sample[i]["h"] >= max(sample[i-2]["h"], sample[i-1]["h"],
+                                  sample[i+1]["h"], sample[i+2]["h"]):
+            highs.append(sample[i]["h"])
+
+    def make_zones(points, kind):
+        zones = []
+        for cluster in cluster_levels(points, tolerance):
+            if len(cluster) < 2:
+                continue
+            level = sum(cluster) / len(cluster)
+            # Count later reactions around the cluster.
+            reactions = sum(
+                1 for c in sample
+                if c["l"] <= level + tolerance and c["h"] >= level - tolerance
+            )
+            recency = sum(
+                1 for c in sample[-30:]
+                if c["l"] <= level + tolerance and c["h"] >= level - tolerance
+            )
+            strength = min(100, len(cluster) * 18 + min(reactions, 8) * 5)
+            zones.append({
+                "type": kind,
+                "low": round(level - tolerance, 2),
+                "high": round(level + tolerance, 2),
+                "level": round(level, 2),
+                "touch_clusters": len(cluster),
+                "reactions": reactions,
+                "recent_reactions": recency,
+                "strength": strength,
+            })
+        return sorted(zones, key=lambda x: x["strength"], reverse=True)
+
+    return {
+        "supports": make_zones(lows, "support"),
+        "resistances": make_zones(highs, "resistance"),
+    }
+
+def nearest_sr(price, sr):
+    candidates = []
+    for z in sr.get("supports", []) + sr.get("resistances", []):
+        dist = zone_distance(price, z)
+        if dist is not None:
+            candidates.append((dist, z))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: x[0])[1]
+
+def psychological_levels(price, step=10.0, tolerance_ratio=0.35):
+    """
+    Round-number / psychological price levels.
+
+    For XAU/USD this uses $10 major increments and $5 half-levels.
+    The exact level is a reference, not a prediction.
+    """
+    if price is None:
+        return {"nearest_major": None, "nearest_half": None, "near": False}
+
+    major = round(price / step) * step
+    half_step = step / 2
+    half = round(price / half_step) * half_step
+
+    distance_major = abs(price - major)
+    distance_half = abs(price - half)
+
+    tolerance = step * tolerance_ratio
+    near_level = min(distance_major, distance_half) <= tolerance
+
+    return {
+        "nearest_major": round(major, 2),
+        "nearest_half": round(half, 2),
+        "distance_major": round(distance_major, 2),
+        "distance_half": round(distance_half, 2),
+        "near": near_level,
+        "major_step": step,
+        "half_step": half_step,
+    }
+
+def sr_confluence(direction, price, sr):
+    """Return nearest S/R context and whether it supports the direction."""
+    supports = sr.get("supports", [])
+    resistances = sr.get("resistances", [])
+
+    if direction == "long":
+        below = [z for z in supports if z["level"] <= price]
+        nearest = max(below, key=lambda z: z["level"]) if below else None
+        return nearest, bool(nearest and price - nearest["level"] <=
+                             max((z["high"] - z["low"]) * 2 for z in supports) if supports else False)
+
+    if direction == "short":
+        above = [z for z in resistances if z["level"] >= price]
+        nearest = min(above, key=lambda z: z["level"]) if above else None
+        return nearest, bool(nearest and nearest["level"] - price <=
+                             max((z["high"] - z["low"]) * 2 for z in resistances) if resistances else False)
+
+    return None, False
+
+def order_flow_proxy(candles, period=20):
+    """
+    Candle/volume-based order-flow PROXY.
+
+    Twelve Data OHLCV does not provide true bid/ask aggressor volume or a
+    Level-2 order book. Therefore this module must never call this 'true
+    order flow'. It estimates pressure from candle location, range and
+    available volume/tick-volume.
+    """
+    if not candles or len(candles) < period:
+        return {
+            "bias": "unknown", "score": 0, "imbalance": 0,
+            "cvd_proxy": 0, "absorption": False, "displacement": False
+        }
+
+    sample = candles[-period:]
+    buy_pressure = 0.0
+    sell_pressure = 0.0
+    signed_flow = 0.0
+    displacement_count = 0
+    absorption_count = 0
+
+    avg_range = sum(max(c["h"] - c["l"], 1e-9) for c in sample) / len(sample)
+    avg_vol = sum(float(c.get("v", 0) or 0) for c in sample) / len(sample)
+
+    for c in sample:
+        rng = max(c["h"] - c["l"], 1e-9)
+        close_location = ((c["c"] - c["l"]) - (c["h"] - c["c"])) / rng
+        vol = float(c.get("v", 0) or 0)
+
+        # -1 to +1 pressure estimate based on candle close location.
+        pressure = max(-1.0, min(1.0, close_location))
+        weighted = pressure * (vol if vol > 0 else 1.0)
+
+        if pressure > 0:
+            buy_pressure += abs(weighted)
+        elif pressure < 0:
+            sell_pressure += abs(weighted)
+
+        signed_flow += weighted
+
+        if rng >= avg_range * 1.5 and abs(pressure) >= 0.55:
+            displacement_count += 1
+
+        # Large volume/range with a poor close can indicate absorption.
+        if avg_vol > 0 and vol >= avg_vol * 1.5 and abs(pressure) <= 0.20:
+            absorption_count += 1
+
+    total = buy_pressure + sell_pressure
+    imbalance = signed_flow / total if total else 0.0
+
+    if imbalance >= 0.18:
+        bias = "bullish"
+    elif imbalance <= -0.18:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    return {
+        "bias": bias,
+        "score": round(max(-100, min(100, imbalance * 100)), 2),
+        "imbalance": round(imbalance, 4),
+        "cvd_proxy": round(signed_flow, 2),
+        "absorption": absorption_count >= 1,
+        "displacement": displacement_count >= 1,
+        "displacement_count": displacement_count,
+        "absorption_count": absorption_count,
+        "note": "OHLCV pressure proxy; not true bid/ask order flow",
+    }
+
+def vwap(candles, period=50):
+    if not candles:
+        return None
+    sample = candles[-min(period, len(candles)):]
+    total_vol = sum(float(c.get("v", 0) or 0) for c in sample)
+    if total_vol <= 0:
+        return sum(c["c"] for c in sample) / len(sample)
+    return sum(((c["h"] + c["l"] + c["c"]) / 3) * float(c.get("v", 0) or 0)
+               for c in sample) / total_vol
+
+def momentum_confluence(candles):
+    if len(candles) < 30:
+        return {"bias": "unknown", "adx_proxy": 0, "rsi": 50, "ema_slope": 0}
+
+    closes = [c["c"] for c in candles]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    e50 = ema(closes, 50)
+    r = rsi(closes, 14) if "rsi" in globals() else None
+
+    # Simple deterministic directional-strength proxy.
+    atr_v = atr(candles, 14)
+    adx_proxy = 0
+    if atr_v and e50:
+        adx_proxy = abs(e9 - e21) / atr_v * 10
+
+    slope = 0
+    if len(closes) >= 10:
+        slope = closes[-1] - closes[-10]
+
+    if e9 > e21 > e50:
+        bias = "bullish"
+    elif e9 < e21 < e50:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    return {
+        "bias": bias,
+        "adx_proxy": round(adx_proxy, 2),
+        "rsi": round(r, 2) if r is not None else None,
+        "ema_slope": round(slope, 2),
+    }
+
+def displacement_quality(candles, direction, period=20):
+    if len(candles) < period + 2:
+        return False
+    sample = candles[-period:]
+    avg = sum(max(c["h"] - c["l"], 1e-9) for c in sample[:-1]) / max(len(sample)-1, 1)
+    c = sample[-1]
+    rng = max(c["h"] - c["l"], 1e-9)
+    body = abs(c["c"] - c["o"])
+    if avg <= 0:
+        return False
+    if direction == "long":
+        return c["c"] > c["o"] and body / rng >= 0.60 and rng >= avg * 1.5
+    if direction == "short":
+        return c["c"] < c["o"] and body / rng >= 0.60 and rng >= avg * 1.5
+    return False
+
+def premium_discount(candles, lookback=60):
+    if len(candles) < 5:
+        return {"zone": "unknown", "mid": None, "high": None, "low": None}
+    sample = candles[-min(lookback, len(candles)):]
+    hi = max(c["h"] for c in sample)
+    lo = min(c["l"] for c in sample)
+    mid = (hi + lo) / 2
+    price = sample[-1]["c"]
+    return {
+        "zone": "premium" if price > mid else "discount",
+        "mid": round(mid, 2),
+        "high": round(hi, 2),
+        "low": round(lo, 2),
+    }
+
+def quality_score(direction, price, c15, c5, bias4, bias1, s15, s5,
+                  sweep, fvg, ob, fib, regime, levels, flow=None,
+                  momentum=None, pd=None, sr=None, psy=None,
+                  sr_near=None, sr_aligned=False):
+    """
+    V20 expanded confluence model.
+    Maximum = 100. Numbers are deterministic weights, not probabilities.
+    """
+    if direction not in ("long", "short"):
+        return 0, []
+
+    wanted = "bullish" if direction == "long" else "bearish"
+    points = 0
+    reasons = []
+
+    checks = [
+        (bias4 == wanted, 10, "4H direction aligned"),
+        (bias1 == wanted, 10, "1H direction aligned"),
+        (s15.get("state") == wanted, 8, "15M structure aligned"),
+        (s15.get("bos") == wanted or s15.get("choch") == wanted, 8, "15M BOS/CHoCH aligned"),
+        (s5.get("state") == wanted, 5, "5M structure aligned"),
+        (sweep and sweep.get("direction") == direction, 12, "Liquidity sweep confirmed"),
+        (bool(fvg), 5, "FVG present"),
+        (bool(ob), 5, "Order-block candidate present"),
+        (in_ote(price, fib, direction), 5, "OTE aligned"),
+        (regime.get("name", "").startswith("trending"), 4, "Trending regime"),
+        (flow and flow.get("bias") == wanted, 12, "Order-flow proxy aligned"),
+        (flow and flow.get("displacement"), 3, "Flow displacement"),
+        (flow and flow.get("absorption"), 2, "Absorption context"),
+        (momentum and momentum.get("bias") == wanted, 4, "Momentum aligned"),
+        (momentum and momentum.get("adx_proxy", 0) >= 10, 2, "Momentum strength"),
+        (pd and ((direction == "long" and pd.get("zone") == "discount") or
+                 (direction == "short" and pd.get("zone") == "premium")), 3,
+         "Premium/discount aligned"),
+        (levels.get("equal_low") is not None and direction == "long", 1, "Equal-low liquidity reference"),
+        (levels.get("equal_high") is not None and direction == "short", 1, "Equal-high liquidity reference"),
+        (sr_near is not None and sr_aligned, 5, "Support/resistance aligned"),
+        (sr_near is not None and sr_near.get("strength", 0) >= 55, 3, "Strong S/R zone"),
+        (psy and psy.get("near"), 3, "Psychological level nearby"),
+        (psy and direction == "long" and psy.get("nearest_major") is not None and
+         psy.get("nearest_major") <= price, 1, "Long below/at major round level"),
+        (psy and direction == "short" and psy.get("nearest_major") is not None and
+         psy.get("nearest_major") >= price, 1, "Short above/at major round level"),
+    ]
+
+    for ok, weight, label in checks:
+        if ok:
+            points += weight
+            reasons.append(label)
+
+    # v22: advanced-level confirmation bonus (capped by helper)
+    try:
+        score += v22_score_bonus(direction, market)
+        score = min(100, score)
+    except Exception:
+        pass
+
+    return min(points, 100), reasons
+
+def score_grade(score):
+    if score >= 85:
+        return "A+"
+    if score >= 75:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 55:
+        return "C"
+    return "NO-TRADE"
+
+def risk_engine(direction, price, s5, c5, atr_value):
+    """Single source of truth for entry, invalidation and R ladder."""
+    if direction not in ("long", "short") or not atr_value or atr_value <= 0:
+        return {"entry": None, "sl": None, "tp": [], "risk": None, "rr_tp10": None}
+
+    entry = float(price)
+
+    if direction == "long":
+        structural_low = s5.get("swing_low") or min(c["l"] for c in c5[-20:])
+        sl = min(structural_low - atr_value * 0.25, entry - atr_value * 1.2)
+        risk = entry - sl
+        tps = [round(entry + risk * x, 2)
+               for x in [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]]
+    else:
+        structural_high = s5.get("swing_high") or max(c["h"] for c in c5[-20:])
+        sl = max(structural_high + atr_value * 0.25, entry + atr_value * 1.2)
+        risk = sl - entry
+        tps = [round(entry - risk * x, 2)
+               for x in [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]]
+
+    if risk <= 0:
+        return {"entry": None, "sl": None, "tp": [], "risk": None, "rr_tp10": None}
+
+    return {
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp": tps,
+        "risk": round(risk, 2),
+        "rr_tp10": 10.0,
+    }
+
+def analyze_market():
+    c4h = get_candles("XAU/USD", "4h", 160)
+    c1h = get_candles("XAU/USD", "1h", 160)
+    c15 = get_candles("XAU/USD", "15min", 220)
+    c5 = get_candles("XAU/USD", "5min", 140)
+
+    if not all([c4h, c1h, c15, c5]):
+        return {"valid": False, "reason": "Insufficient market data"}
+
+    price = c5[-1]["c"]
+
+    # ---------------- ROSITA ----------------
+    bias4 = tf_bias(c4h)
+    bias1 = tf_bias(c1h)
+
+    s4 = structure_state(c4h)
+    s1 = structure_state(c1h)
+    s15 = structure_state(c15)
+    s5 = structure_state(c5)
+
+    # Rosita is deliberately conservative: continuation requires 4H+1H
+    # alignment. A sweep can suggest reversal, but does not override the
+    # higher-timeframe bias automatically.
+    rosita_direction = None
+    if bias4 == "bullish" and bias1 == "bullish":
+        rosita_direction = "long"
+    elif bias4 == "bearish" and bias1 == "bearish":
+        rosita_direction = "short"
+
+    # ---------------- MAGNA ----------------
+    sweep = liquidity_sweep(c15, lookback=24)
+    fib = fib_ote(c15, 60)
+
+    long_fvg = nearest_fvg(c15, "bullish", price)
+    short_fvg = nearest_fvg(c15, "bearish", price)
+    long_ob = order_block_candidate(c15, "bullish")
+    short_ob = order_block_candidate(c15, "bearish")
+
+    # A sweep can identify a reversal candidate, but V19 records both the
+    # Rosita trend direction and Magna's candidate direction separately.
+    candidate = rosita_direction
+    if sweep:
+        if sweep["direction"] == "bullish":
+            candidate = "long"
+        elif sweep["direction"] == "bearish":
+            candidate = "short"
+
+    fvg = long_fvg if candidate == "long" else short_fvg if candidate == "short" else None
+    ob = long_ob if candidate == "long" else short_ob if candidate == "short" else None
+
+    # ---------------- HARLEEN -----------------
+    news = get_news_warning()
+    session = session_name()
+    regime = market_regime(c15)
+    levels = {}
+    levels.update(price_levels(c15, 60))
+    levels.update(session_levels(c15))
+
+    # Multi-timeframe S/R maps. 15M is the primary execution map while 1H/4H
+    # are used as higher-timeframe references.
+    sr4 = support_resistance(c4h, 120)
+    sr1 = support_resistance(c1h, 120)
+    sr15 = support_resistance(c15, 160)
+    psy = psychological_levels(price, step=10.0)
+
+    flow = order_flow_proxy(c5, 20)
+    momentum = momentum_confluence(c15)
+    pd = premium_discount(c15, 60)
+    vwap_value = vwap(c15, 50)
+
+    # Harleen hard vetoes remain separate from the quality score.
+    veto_reasons = []
+    if news:
+        veto_reasons.append(news)
+
+    # Avoid treating unknown regime as a veto; it simply lowers confidence.
+    if regime.get("name") == "unknown":
+        veto_reasons.append("Market regime could not be classified")
+
+    harleen_veto = bool(news)
+
+    # ---------------- OBJECTIVE SCORE ----------------
+    score, confluences = quality_score(
+        candidate, price, c15, c5, bias4, bias1, s15, s5,
+        sweep, fvg, ob, fib, regime, levels,
+        flow=flow, momentum=momentum, pd=pd,
+        sr=sr15, psy=psy,
+        sr_near=nearest_sr(price, sr15),
+        sr_aligned=sr_confluence(candidate, price, sr15)[1] if candidate else False
+    )
+    grade = score_grade(score)
+
+    # V19 threshold: 75+ required, plus no hard Harleen veto.
+    flow_aligned = flow.get("bias") == ("bullish" if candidate == "long" else "bearish")
+    setup_valid = (
+        candidate in ("long", "short")
+        and score >= 75
+        and not harleen_veto
+        and regime.get("name") != "unknown"
+        and flow.get("bias") != "unknown"
+    )
+    if candidate and not flow_aligned:
+        veto_reasons.append("Order-flow proxy conflicts with setup direction")
+
+    # ---------------- RISK ENGINE ----------------
+    a = atr(c5, 14)
+    risk = risk_engine(candidate, price, s5, c5, a)
+
+    if setup_valid and risk["sl"] is None:
+        setup_valid = False
+        veto_reasons.append("Risk engine could not produce valid invalidation")
+
+    if score < 75:
+        veto_reasons.append(f"Objective score {score}/100 below A-grade threshold")
+
+    if candidate is None:
+        veto_reasons.append("4H/1H directional bias is not aligned")
+
+    if rosita_direction and sweep and sweep["direction"] != rosita_direction:
+        confluences.append("Magna sweep conflicts with Rosita trend")
+
+    signal_id = make_signal_id()
+
+    result = {
+        "valid": setup_valid,
+        "signal_id": signal_id,
+        "symbol": "XAU/USD",
+        "price": round(price, 2),
+
+        "rosita": {
+            "role": "Boss / top-down trend analyst",
+            "bias_4h": bias4,
+            "bias_1h": bias1,
+            "direction": rosita_direction,
+            "structure_4h": s4["state"],
+            "structure_1h": s1["state"],
+            "structure_15m": s15["state"],
+            "structure_5m": s5["state"],
+            "bos_15m": s15["bos"],
+            "choch_15m": s15["choch"],
+        },
+
+        "harleen": {
+            "role": "Risk manager / veto",
+            "verdict": "VETO" if harleen_veto else "PASS",
+            "news": news or "No high-impact USD warning in configured window",
+            "session": session,
+            "veto_reasons": veto_reasons[:6],
+        },
+
+        "magna": {
+            "role": "Sniper / setup analyst",
+            "direction": candidate,
+            "sweep": sweep,
+            "fvg": fvg,
+            "order_block": ob,
+            "fib": fib,
+            "ote": in_ote(price, fib, candidate) if candidate else False,
+        },
+
+        "market": {
+            "regime": regime,
+            "levels": levels,
+            "vwap": round(vwap_value, 2) if vwap_value else None,
+            "premium_discount": pd,
+            "momentum": momentum,
+            "order_flow_proxy": flow,
+            "support_resistance": {
+                "4h": sr4,
+                "1h": sr1,
+                "15m": sr15,
+                "nearest": nearest_sr(price, sr15),
+            },
+            "psychological_levels": psy,
+        },
+
+        "risk": {
+            "atr_5m": round(a, 2) if a else None,
+            **risk,
+        },
+
+        "score": score,
+        "grade": grade,
+        "confluences": confluences[:12],
+        "reasons": veto_reasons[:8],
+    }
+
+    # Record every scan that reaches the objective engine. This makes
+    # later research possible even for rejected setups.
+    journal_signal(result, event="SCAN")
+    return result
+
+# ============================================================
+# GROQ EXPLANATION
+# ============================================================
+
+SYSTEM = """
+You are SWARM v21.0 — three girls in one brain, backed by an objective Python referee.
+
+ALWAYS include: 🫦 👀 💕
+
+ROSITA (Boss/Alice)
+- Top-down analyst.
+- Reads 4H -> 1H -> 15M -> 5M.
+- Focuses on trend and market structure.
+- Does NOT invent technical values.
+
+HARLEEN QUINZEL (Risk/Azariah)
+- Risk controller and veto.
+- If news says VETO, the final answer MUST be VETO.
+- Looks at session context and setup quality.
+- Manual execution only.
+
+MAGNA (Sniper/Nora)
+- Looks for liquidity sweep, BOS/CHoCH, FVG, order-block candidate and OTE.
+- Uses ONLY the values supplied by the Python engine.
+- Does NOT invent Entry, SL or TP.
+- If Magna conflicts with Rosita, explicitly say so.\n- Treat order-flow as an OHLCV proxy unless a real bid/ask feed is connected.
+
+CRITICAL:
+The Python engine is the source of truth for all numerical technical measurements.
+Never invent an Entry, SL, TP, ATR, score, Fibonacci level, or market structure value.
+If Python says no valid setup, say no valid setup.
+
+This is educational/manual analysis only, not guaranteed financial advice.
+Call the user Shay.
+
+Preferred format:
+
+SWARM v21.0
+Bias 4H/1H: ...
+Rosita: ...
+Harleen Verdict: PASS/VETO — reason
+Magna Snipe: ...
+Direction: ...
+Entry: ...
+SL: ...
+TP1-TP10: ...
+Objective Score: ...
+Reason: ...
+Confluences:
+- ...
+- ...
+- ...
+
+If invalid:
+NO VALID A/B/C SETUP
+Harleen: ...
+Reason: ...
 """
 
 async def ask_groq(user_text, chat_id):
-    cid=str(chat_id); HISTORY[cid].append({"role":"user","content":user_text})
-    mem=LONG_MEM.get(cid,"")
-    if not client: return "No brain yet Shay 🫦 👀 add GROQ_API_KEY 💕"
-    msgs=[{"role":"system","content":SYSTEM+f"\n[Memory] {mem}"}]
-    for m in list(HISTORY[cid])[-10:]: msgs.append(m)
+    cid = str(chat_id)
+
+    HISTORY[cid].append({
+        "role": "user",
+        "content": user_text,
+    })
+
+    mem = LONG_MEM.get(cid, "")
+
+    if not client:
+        return "No brain yet Shay 🫦 👀 add GROQ_API_KEY 💕"
+
+    msgs = [{
+        "role": "system",
+        "content": SYSTEM + f"\n[Memory] {mem}",
+    }]
+
+    for m in list(HISTORY[cid])[-10:]:
+        msgs.append(m)
+
     try:
-        # WORKING MODEL 2026 - Groq killed llama models on Aug 16
-        r=client.chat.completions.create(model="openai/gpt-oss-20b",messages=msgs,temperature=0.6,max_tokens=1200)
-        txt=r.choices[0].message.content.strip(); HISTORY[cid].append({"role":"assistant","content":txt}); return txt
+        r = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=msgs,
+            temperature=0.2,
+            max_tokens=1200,
+        )
+
+        txt = r.choices[0].message.content.strip()
+
+        HISTORY[cid].append({
+            "role": "assistant",
+            "content": txt,
+        })
+
+        return txt
+
     except Exception as e:
-        logger.error(e)
+        logger.error("Groq error: %s", e)
         return f"Brain fog Shay 🫦 👀 {e} 💕"
 
+# ============================================================
+# FORMAT OBJECTIVE RESULT
+# ============================================================
+
+def objective_text(a):
+    m = a.get("magna", {})
+    r = a.get("risk", {})
+    h = a.get("harleen", {})
+    ros = a.get("rosita", {})
+    market = a.get("market", {})
+    regime = market.get("regime", {})
+
+    if not a.get("valid"):
+        return (
+            "SWARM v21.0 OBJECTIVE SCAN\n"
+            f"Signal ID: {a.get('signal_id', 'N/A')}\n"
+            f"Price: {a.get('price', 'N/A')}\n"
+            f"Rosita 4H/1H: {ros.get('bias_4h')} / {ros.get('bias_1h')}\n"
+            f"Rosita direction: {ros.get('direction')}\n"
+            f"Harleen: {h.get('verdict')}\n"
+            f"Session: {h.get('session')}\n"
+            f"Regime: {regime.get('name')}\n"
+            f"Objective score: {a.get('score', 0)}/100 ({a.get('grade')})\n"
+            "NO VALID SETUP\n"
+            + "\n".join(f"- {x}" for x in a.get("reasons", []))
+        )
+
+    return (
+        "SWARM v21.0 OBJECTIVE SCAN\n"
+        f"Signal ID: {a['signal_id']}\n"
+        f"Price: {a['price']}\n"
+        f"Rosita 4H/1H: {ros.get('bias_4h')} / {ros.get('bias_1h')}\n"
+        f"Rosita direction: {ros.get('direction')}\n"
+        f"15M/5M structure: {ros.get('structure_15m')} / {ros.get('structure_5m')}\n"
+        f"Harleen: {h.get('verdict')}\n"
+        f"Session: {h.get('session')}\n"
+        f"Regime: {regime.get('name')}\n"
+        f"VWAP: {market.get('vwap')}\n"
+        f"Premium/Discount: {market.get('premium_discount', {}).get('zone')}\n"
+        f"Nearest S/R: {market.get('support_resistance', {}).get('nearest')}\n"
+        f"Psychological level: {market.get('psychological_levels', {}).get('nearest_major')} "
+        f"/ {market.get('psychological_levels', {}).get('nearest_half')}\n"
+        f"Momentum: {market.get('momentum', {}).get('bias')}\n"
+        f"Order-flow proxy: {market.get('order_flow_proxy', {}).get('bias')} "
+        f"(imbalance {market.get('order_flow_proxy', {}).get('imbalance')})\n"
+        f"Direction: {m.get('direction')}\n"
+        f"Liquidity sweep: {m.get('sweep')}\n"
+        f"FVG: {m.get('fvg')}\n"
+        f"Order block: {m.get('order_block')}\n"
+        f"OTE: {m.get('ote')}\n"
+        f"ATR 5M: {r.get('atr_5m')}\n"
+        f"Entry: {r.get('entry')}\n"
+        f"SL: {r.get('sl')}\n"
+        f"TP1-TP10: {r.get('tp')}\n"
+        f"Risk per unit: {r.get('risk')}\n"
+        f"Objective score: {a.get('score')}/100 ({a.get('grade')})\n"
+        "Confluences:\n"
+        + "\n".join(f"- {x}" for x in a.get("confluences", []))
+    )
+
+# ============================================================
+# JOURNAL ANALYTICS
+# ============================================================
+
+def journal_stats():
+    rows = load_journal()
+    scans = [x for x in rows if x.get("event") == "SCAN"]
+    resolved = [x for x in rows if x.get("outcome") in ("win", "loss") and x.get("r_result") is not None]
+
+    valid = [x for x in scans if x.get("valid")]
+    by_grade = {}
+    for row in valid:
+        g = row.get("grade", "UNKNOWN")
+        by_grade[g] = by_grade.get(g, 0) + 1
+
+    return {
+        "total_scans": len(scans),
+        "valid_setups": len(valid),
+        "resolved": len(resolved),
+        "grades": by_grade,
+    }
+
+def format_journal_stats():
+    s = journal_stats()
+    grades = ", ".join(f"{k}: {v}" for k, v in sorted(s["grades"].items())) or "none"
+    return (
+        "SWARM v21.0 JOURNAL\n"
+        f"Scans recorded: {s['total_scans']}\n"
+        f"Valid setups recorded: {s['valid_setups']}\n"
+        f"Resolved trades: {s['resolved']}\n"
+        f"Grades: {grades}\n\n"
+        "The journal stores research data; it does not prove profitability."
+    )
+
+# ============================================================
+# WALK-FORWARD RESEARCH
+# ============================================================
+
+def evaluate_fixed_r(candles, start, end, min_score=75, lookahead=30):
+    """Evaluate V19-style objective logic on a historical slice."""
+    if end <= start or end > len(candles):
+        return []
+
+    trades = []
+    warmup = 70
+
+    for i in range(max(start, warmup), min(end, len(candles) - lookahead)):
+        hist = candles[:i + 1]
+        price = hist[-1]["c"]
+
+        bias = tf_bias(hist)
+        s = structure_state(hist)
+        sweep = liquidity_sweep(hist, lookback=min(24, len(hist) - 3))
+        fib = fib_ote(hist, min(60, len(hist)))
+        fvg = nearest_fvg(hist, "bullish" if bias == "bullish" else "bearish", price)
+        ob = order_block_candidate(hist, "bullish" if bias == "bullish" else "bearish")
+        regime = market_regime(hist)
+
+        direction = None
+        if bias == "bullish" and s["state"] == "bullish":
+            direction = "long"
+        elif bias == "bearish" and s["state"] == "bearish":
+            direction = "short"
+
+        if sweep and sweep["direction"] in ("long", "short"):
+            # Sweep is confirmation/reversal evidence, not an unconditional
+            # override of the higher-timeframe direction in the tester.
+            if direction is None:
+                direction = sweep["direction"]
+
+        if not direction:
+            continue
+
+        wanted = "bullish" if direction == "long" else "bearish"
+        score = 0
+        if bias == wanted: score += 20
+        if s["state"] == wanted: score += 20
+        if s["bos"] == wanted or s["choch"] == wanted: score += 10
+        if sweep and sweep["direction"] == direction: score += 20
+        if fvg: score += 8
+        if ob: score += 8
+        if in_ote(price, fib, direction): score += 8
+        if regime.get("name", "").startswith("trending"): score += 6
+
+        if score < min_score:
+            continue
+
+        a = atr(hist, 14)
+        risk = risk_engine(direction, price, s, hist, a)
+        if not risk["sl"]:
+            continue
+
+        outcome = None
+        r_value = None
+        for c in candles[i + 1:i + 1 + lookahead]:
+            if direction == "long":
+                hit_sl = c["l"] <= risk["sl"]
+                hit_tp = c["h"] >= risk["tp"][2]  # 2R
+            else:
+                hit_sl = c["h"] >= risk["sl"]
+                hit_tp = c["l"] <= risk["tp"][2]
+
+            # Conservative same-candle handling: SL is counted first if both
+            # levels appear inside the same candle.
+            if hit_sl:
+                outcome, r_value = "loss", -1.0
+                break
+            if hit_tp:
+                outcome, r_value = "win", 2.0
+                break
+
+        if outcome:
+            trades.append({
+                "index": i,
+                "direction": direction,
+                "score": score,
+                "outcome": outcome,
+                "r": r_value,
+            })
+
+    return trades
+
+def summarize_trades(trades):
+    if not trades:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0,
+            "net_r": 0, "profit_factor": 0, "max_drawdown_r": 0
+        }
+
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    wins = losses = 0
+    gross_profit = gross_loss = 0.0
+
+    for t in trades:
+        r = t["r"]
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+        if r > 0:
+            wins += 1
+            gross_profit += r
+        else:
+            losses += 1
+            gross_loss += abs(r)
+
+    return {
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / len(trades) * 100, 2),
+        "net_r": round(equity, 2),
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss else 0,
+        "max_drawdown_r": round(max_dd, 2),
+    }
+
+def walk_forward_backtest(candles, folds=5):
+    """
+    Sequential walk-forward evaluation. Each fold is an out-of-sample
+    evaluation window; no future candles are used by the signal logic.
+    """
+    if not candles or len(candles) < 700:
+        return {"error": "Need at least ~700 candles for a meaningful 5-fold test"}
+
+    n = len(candles)
+    step = n // folds
+    fold_results = []
+
+    for fold in range(folds):
+        start = fold * step
+        end = n if fold == folds - 1 else (fold + 1) * step
+        # Give each fold the candles before its start as historical context.
+        test_start = max(0, start)
+        trades = evaluate_fixed_r(candles, test_start, end)
+        fold_results.append({
+            "fold": fold + 1,
+            "start": candles[start]["t"],
+            "end": candles[end - 1]["t"],
+            **summarize_trades(trades),
+        })
+
+    all_trades = []
+    for fr in fold_results:
+        # Fold-level summaries are enough for the Telegram output; the
+        # aggregate is recomputed from their net/win/loss counts.
+        all_trades.extend([{"r": 2.0 if i < fr["wins"] else -1.0}
+                           for i in range(fr["trades"])])
+
+    return {
+        "folds": fold_results,
+        "aggregate": summarize_trades(all_trades),
+    }
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def backtest_engine(candles, warmup=60, lookahead=30, min_score=75):
+    """Compatibility wrapper: V19's primary research mode is walk-forward."""
+    if not candles or len(candles) < warmup + lookahead + 20:
+        return {
+            "trades": 0, "wins": 0, "losses": 0,
+            "win_rate": 0, "net_r": 0, "profit_factor": 0,
+            "max_drawdown_r": 0
+        }
+    trades = evaluate_fixed_r(
+        candles,
+        start=warmup,
+        end=len(candles) - lookahead,
+        min_score=min_score,
+        lookahead=lookahead,
+    )
+    return summarize_trades(trades)
+
+
+# ============================================================
+# TELEGRAM HANDLERS
+# ============================================================
+
 async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    low=update.message.text.lower().strip()
-    if low in ["hi","hello","hey","yo"]:
-        await update.message.reply_text("Hey Shay 🫦 👀 Swarm v17.2 online — Rosita + Harleen + Magna manual mode — gpt-oss-20b fixed 💕"); return
+    if not update.message or not update.message.text:
+        return
+
+    low = update.message.text.lower().strip()
+
+    if low in ["hi", "hello", "hey", "yo"]:
+        await update.message.reply_text(
+            "Hey Shay 🫦 👀 Swarm v21.0 online — "
+            "Rosita + Harleen Quinzel + Magna + objective Python engine 💕"
+        )
+        return
+
     if low.startswith("remember "):
-        LONG_MEM[str(update.effective_chat.id)]=(LONG_MEM.get(str(update.effective_chat.id),"")+" "+update.message.text[9:]).strip()[-1000:]; save_mem()
-        await update.message.reply_text("Got it Shay 🫦 👀 I'll remember 💕"); return
+        cid = str(update.effective_chat.id)
+
+        LONG_MEM[cid] = (
+            LONG_MEM.get(cid, "") + " " + update.message.text[9:]
+        ).strip()[-1000:]
+
+        save_mem()
+
+        await update.message.reply_text(
+            "Got it Shay 🫦 👀 I'll remember 💕"
+        )
+        return
+
     if "news" in low:
-        w=get_news_warning(); await update.message.reply_text(w if w else "No high-impact USD in next 60m - Harleen says clear 🫦 👀 💕"); return
-    if ("analyze" in low and "gold" in low) or low in ["signal","scalp","analyze gold","gold","xau"]:
-        await update.message.reply_text("Swarm scanning Shay 🫦 👀 Rosita + Harleen + Magna debating...")
-        c4h=get_candles("XAU/USD","4h",50); c1h=get_candles("XAU/USD","1h",50); c15=get_candles("XAU/USD","15min",60); c5=get_candles("XAU/USD","5min",20)
-        if c4h and c1h and c15 and c5:
-            ctx_top=f"4h {tf_bias(c4h)} @ {c4h[-1]['c']:.2f} | 1h {tf_bias(c1h)} @ {c1h[-1]['c']:.2f} | 15m {tf_bias(c15)} @ {c15[-1]['c']:.2f} | 5m {c5[-1]['c']:.2f}"
-        else: ctx_top="partial data"
-        fib=fib_levels(c15,50)
-        if fib: ctx_top+=f" | Fib H {fib['high']:.2f} L {fib['low']:.2f} OTE 61.8 {fib['0.618']:.2f} 65 {fib['0.65']:.2f} 70.5 {fib['0.705']:.2f} 79 {fib['0.79']:.2f}"
-        news_w=get_news_warning()
-        sig=await ask_groq(f"Top-down XAU/USD scalp. {ctx_top}. News: {news_w}. Live {get_live_price()}. Do Rosita->Harleen->Magna debate then final format.", update.effective_chat.id)
-        await update.message.reply_text(sig); return
-    p=get_live_price(); price_ctx=f"\n[Live XAU/USD: {p:.2f}]" if p else ""
-    reply=await ask_groq(update.message.text+price_ctx, update.effective_chat.id)
+        warning = get_news_warning()
+
+        await update.message.reply_text(
+            warning
+            if warning
+            else "No high-impact USD warning in the configured window — Harleen PASS 🫦 👀 💕"
+        )
+        return
+
+    if low in ["signal", "scalp", "analyze gold", "gold", "xau"] or (
+        "analyze" in low and "gold" in low
+    ):
+        await update.message.reply_text(
+            "Swarm scanning Shay 🫦 👀 "
+            "Rosita + Harleen Quinzel + Magna + Python engine..."
+        )
+
+        result = analyze_market()
+        obj = objective_text(result)
+
+        # Groq receives objective measurements, not permission to
+        # invent the numerical trade.
+        explanation = await ask_groq(
+            "Analyze this OBJECTIVE PYTHON ENGINE result. "
+            "Do not alter any numerical value.\n\n" + obj,
+            update.effective_chat.id,
+        )
+
+        await update.message.reply_text(explanation)
+        return
+
+    if low in ["support", "resistance", "support resistance", "sr"]:
+        a = analyze_market()
+        sr = a.get("market", {}).get("support_resistance", {})
+        psy = a.get("market", {}).get("psychological_levels", {})
+        await update.message.reply_text(
+            "SWARM v21.0 S/R + PSYCHOLOGICAL LEVELS\n"
+            f"Price: {a.get('price')}\n"
+            f"Nearest 15M S/R: {sr.get('nearest')}\n"
+            f"Psychological major: {psy.get('nearest_major')}\n"
+            f"Psychological half-level: {psy.get('nearest_half')}\n\n"
+            "S/R strength is based on repeated historical swing reactions."
+        )
+        return
+
+    if low in ["orderflow", "flow", "order flow"]:
+        a = analyze_market()
+        flow = a.get("market", {}).get("order_flow_proxy", {})
+        await update.message.reply_text(
+            "SWARM v21.0 ORDER-FLOW PROXY\n"
+            f"Signal ID: {a.get('signal_id')}\n"
+            f"Bias: {flow.get('bias')}\n"
+            f"Imbalance: {flow.get('imbalance')}\n"
+            f"CVD proxy: {flow.get('cvd_proxy')}\n"
+            f"Displacement: {flow.get('displacement')}\n"
+            f"Absorption: {flow.get('absorption')}\n\n"
+            "Important: Twelve Data OHLCV is not true bid/ask order flow. "
+            "This is a candle/volume pressure proxy."
+        )
+        return
+
+    if low in ["journal", "stats", "journal stats"]:
+        await update.message.reply_text(format_journal_stats())
+        return
+
+    if low in ["backtest", "test", "backtest gold", "walkforward", "walk-forward"]:
+        await update.message.reply_text(
+            "Running research backtest on the available XAU/USD dataset Shay 🫦 👀..."
+        )
+
+        candles = get_candles("XAU/USD", "15min", 2000)
+
+        if not candles:
+            await update.message.reply_text(
+                "Backtest unavailable — Twelve Data did not return enough candles."
+            )
+            return
+
+        result = backtest_engine(candles)
+
+        await update.message.reply_text(
+            "SWARM v21.0 RESEARCH BACKTEST\n"
+            f"Trades: {result['trades']}\n"
+            f"Wins: {result['wins']}\n"
+            f"Losses: {result['losses']}\n"
+            f"Win rate: {result['win_rate']}%\n"
+            f"Net R: {result['net_r']}\n"
+            f"Profit factor: {result['profit_factor']}\n"
+            f"Max drawdown: {result['max_drawdown_r']} R\n\n"
+            "This is historical research only; it excludes live spread/slippage "
+            "and is not a guarantee of future performance."
+        )
+        return
+
+    # General questions can still use Groq, with current live price.
+    p = get_live_price()
+    price_ctx = f"\n[Live XAU/USD: {p:.2f}]" if p else ""
+
+    reply = await ask_groq(
+        update.message.text + price_ctx,
+        update.effective_chat.id,
+    )
+
     await update.message.reply_text(reply)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Rosita + Harleen Quinzel + Magna online 🫦 👀 Manual signals only — gpt-oss-20b 💕\nType: analyze gold")
+    await update.message.reply_text(
+        "Rosita + Harleen Quinzel + Magna online 🫦 👀 💕\n"
+        "Objective Python engine active.\n\n"
+        "Commands:\n"
+        "analyze gold — objective multi-timeframe analysis\n"
+        "news — high-impact USD check\n"
+        "backtest — historical research test\n"
+        "journal — scan/journal statistics\n"
+        "orderflow — inspect latest order-flow proxy\n"
+        "support — inspect support/resistance + psychological levels\n\n"
+        "Manual/educational mode only."
+    )
+
+# ============================================================
+# AUTO SIGNAL
+# ============================================================
 
 async def auto_signal_loop(app):
     await asyncio.sleep(10)
+
     while True:
         try:
             if BOSS_CHAT_ID.strip():
-                hr=datetime.now(timezone.utc).hour
-                if hr>=21 or hr<5:
-                    await asyncio.sleep(300); continue
+                # UTC schedule.
+                hr = datetime.now(timezone.utc).hour
+
+                if hr >= 21 or hr < 5:
+                    await asyncio.sleep(300)
+                    continue
+
+                # Harleen vetoes before the engine generates a signal.
                 if get_news_warning():
-                    await asyncio.sleep(1800); continue
-                c15=get_candles("XAU/USD","15min",60)
-                if c15:
-                    last=c15[-1]["c"]
-                    sig=await ask_groq(f"Swarm auto-scan XAU/USD at {last}. Manual signal only. If no setup reply exactly 'No A/B/C setup'", BOSS_CHAT_ID)
-                    if "Entry:" in sig and "SL:" in sig and "No A/B/C" not in sig:
-                        await app.bot.send_message(chat_id=int(BOSS_CHAT_ID), text=f"{sig}\n\nManual only 💕")
-        except Exception as e: logger.error(e)
+                    await asyncio.sleep(1800)
+                    continue
+
+                result = analyze_market()
+
+                if result.get("valid"):
+                    obj = objective_text(result)
+
+                    sig = await ask_groq(
+                        "Explain this objective result exactly. "
+                        "Do not change Entry, SL or TP.\n\n" + obj,
+                        BOSS_CHAT_ID,
+                    )
+
+                    await app.bot.send_message(
+                        chat_id=int(BOSS_CHAT_ID),
+                        text=(
+                            sig
+                            + "\n\n"
+                            "Manual/educational analysis only 🫦 👀 💕\n"
+        "Python is the numerical source of truth."
+                        ),
+                    )
+
+        except Exception as e:
+            logger.error("Auto loop error: %s", e)
+
         await asyncio.sleep(300)
 
-async def post_init(app): asyncio.create_task(auto_signal_loop(app))
+async def post_init(app):
+    asyncio.create_task(auto_signal_loop(app))
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))
-    print("Swarm v17.2 gpt-oss-20b FIXED starting...")
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg)
+    )
+
+    print(
+        "Swarm v21.0 Rosita + Harleen Quinzel + Magna "
+        "objective engine starting..."
+    )
+
     app.run_polling()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
+
+
+    # ---------- v22 advanced objective enrichment ----------
+    try:
+        base15 = market.get("candles", {}).get("15min") or market.get("candles", {}).get("15m") or []
+        base5 = market.get("candles", {}).get("5min") or market.get("candles", {}).get("5m") or []
+        base1h = market.get("candles", {}).get("1h") or []
+        base4h = market.get("candles", {}).get("4h") or []
+
+        level_source = base15 or base5 or base1h
+        market["v22_levels"] = {
+            "previous_periods": previous_period_levels(level_source),
+            "sessions": session_levels(level_source),
+        }
+
+        # 5M S/R was previously omitted from the dedicated map.
+        if base5 and "support_resistance" in globals():
+            market.setdefault("support_resistance", {})["5M"] = support_resistance(base5)
+
+        # S/R states for nearest zones.
+        sr_map = market.get("support_resistance", {})
+        nearest = {}
+        for tf, srdata in sr_map.items():
+            if isinstance(srdata, dict):
+                nearest[tf] = {}
+                for side in ("support", "resistance"):
+                    zones = srdata.get(side) or []
+                    if zones:
+                        z = zones[0]
+                        nearest[tf][side] = {
+                            **z,
+                            "state": sr_state(current_price, z)
+                        }
+        market["sr_states"] = nearest
+
+        # Break/retest checks around nearest S/R.
+        market["break_retest"] = {}
+        for side, direction in (("resistance", "LONG"), ("support", "SHORT")):
+            z = (nearest.get("15M", {}) or {}).get(side)
+            if z:
+                market["break_retest"][side] = break_retest_confirmation(
+                    base5 or base15, z.get("level"), direction, market.get("atr")
+                )
+
+        # Fibonacci extensions based on latest objective swing pair.
+        swings = market.get("structure", {}) or {}
+        sh = swings.get("swing_high")
+        sl = swings.get("swing_low")
+        if sh is not None and sl is not None:
+            market["fib_extensions"] = {
+                "LONG": fib_extension_targets(current_price, sh, sl, "LONG"),
+                "SHORT": fib_extension_targets(current_price, sh, sl, "SHORT"),
+            }
+
+        # Momentum divergence when an RSI-like series exists.
+        ind = market.get("rsi_values") or market.get("momentum_values")
+        if ind:
+            market["divergence"] = divergence_detection(base15, ind)
+        else:
+            market["divergence"] = {"bullish": False, "bearish": False, "details": "indicator series unavailable"}
+
+        # Compact level-overlap map: S/R against FVG/OB/OTE/liquidity references.
+        market["level_confluence"] = {
+            "sr_available": bool(sr_map),
+            "psychological_available": bool(market.get("psychological_levels")),
+            "previous_periods_available": bool(market["v22_levels"]["previous_periods"]),
+            "sessions_available": bool(market["v22_levels"]["sessions"]),
+            "break_retest": market.get("break_retest", {}),
+        }
+    except Exception as e:
+        market["v22_levels_error"] = str(e)
+

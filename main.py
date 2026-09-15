@@ -164,12 +164,12 @@ async def auto_signal_loop(app):
 
 async def post_init(app): asyncio.create_task(auto_signal_loop(app))
 
-async def main():
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_msg))
     print("Swarm v17.1 FIXED for Python 3.14.3 starting...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__=="__main__":
-    asyncio.run(main())
+    main()
